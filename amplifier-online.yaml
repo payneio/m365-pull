@@ -1,0 +1,45 @@
+# Amplifier Online - Azure Static Web App Stack Configuration
+# Documentation: https://github.com/payneio/amplifier-online/blob/main/docs/stacks/static-web-app.md
+
+name: m365-pull
+stack: static-web-app
+
+# Static frontend (built and deployed by GitHub Actions)
+frontend:
+  type: static-web-app
+  repo: "https://github.com/bkrabach/m365-pull"
+  branch: main
+  app_location: "/"  # Path to frontend code in repo (e.g., "/frontend" for monorepo)
+  output_location: "dist"  # Build output directory (must match vite/webpack/next config)
+  build_command: "npm run build"  # Optional - defaults to "npm run build"
+
+# Note: This stack is STATIC ONLY (no backend, no databases, no SSR)
+# Need backend API? Use web-app-awa (Web App + Static Web App)
+# Need SSR or containers? Use web-app-aca (Container Apps)
+
+# BEFORE YOU DEPLOY:
+# 1. Commit your frontend code to a GitHub repository
+# 2. Test build locally: npm run build
+# 3. Verify output_location matches your build config (dist/, build/, out/)
+# 4. Update frontend.repo above with your GitHub repository URL
+# 5. Run: amplifier-online up
+#
+# AFTER DEPLOYMENT:
+# - Get deployment token: Azure Portal → Static Web App → Manage deployment token → Copy
+# - Add AZURE_STATIC_WEB_APPS_API_TOKEN to GitHub repository secrets:
+#   Settings → Secrets and variables → Actions → New repository secret
+# - Generate CI/CD: amplifier-online cicd create
+# - Push to GitHub: automatic deployment starts!
+#
+# AUTOMATIC FEATURES:
+# ✅ PR preview deployments (each PR gets its own URL)
+# ✅ Free custom domain SSL certificates
+# ✅ Built-in authentication (EasyAuth)
+# ✅ GitHub-integrated CI/CD
+#
+# COMMON ISSUES:
+# - SPA routing 404s on refresh? Add staticwebapp.config.json with navigationFallback
+# - Build fails? Check GitHub Actions logs and match Node version locally
+# - Wrong files deployed? Verify output_location matches your build output directory
+#
+# Need help? See: https://github.com/payneio/amplifier-online/blob/main/docs/stacks/static-web-app.md

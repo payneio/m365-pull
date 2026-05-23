@@ -1,0 +1,603 @@
+:root {
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --fg: #1f1f1f;
+  --muted: #6b6b6b;
+  --border: #e0e0e0;
+  --accent: #0078d4;
+  --accent-hover: #106ebe;
+  --row-hover: #f4f4f4;
+  --danger: #b3261e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family:
+    "Segoe UI",
+    system-ui,
+    -apple-system,
+    sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.45;
+}
+
+#app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 3rem;
+}
+
+h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+button {
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 4px;
+  cursor: pointer;
+  transition:
+    background 100ms,
+    border-color 100ms;
+}
+
+button:hover {
+  background: var(--row-hover);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+
+button.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+select {
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+/* Sign-in card */
+.signin-card {
+  max-width: 420px;
+  margin: 5rem auto;
+  padding: 2rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  text-align: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.signin-card h1 {
+  margin-bottom: 0.75rem;
+}
+
+.signin-card p {
+  color: var(--muted);
+  margin: 0 0 1.5rem 0;
+}
+
+/* Header */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.5rem;
+}
+
+.user {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.user-name {
+  font-weight: 500;
+}
+
+/* Sync badge in header */
+.sync-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  cursor: help;
+  user-select: none;
+}
+
+.sync-badge.idle {
+  color: var(--muted);
+}
+
+.sync-badge.syncing {
+  background: #fff7ed;
+  color: #b45309;
+  border-color: #fcd34d;
+}
+
+.sync-badge.synced {
+  background: #ecfdf5;
+  color: #047857;
+  border-color: #6ee7b7;
+}
+
+.sync-badge.synced::before {
+  content: "●";
+  color: #10b981;
+  font-size: 0.55rem;
+}
+
+.sync-badge.error,
+.sync-badge.offline {
+  background: #fef2f2;
+  color: #991b1b;
+  border-color: #fca5a5;
+}
+
+/* Action bar */
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.actions .label {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.onedrive-folder {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.link-button {
+  border: none;
+  background: transparent;
+  padding: 0.15rem 0.4rem;
+  color: var(--accent);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  cursor: pointer;
+  border-radius: 3px;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.icon-button {
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 0.2rem 0.5rem;
+  font-size: 1.1rem;
+  cursor: pointer;
+  color: var(--muted);
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.icon-button:hover {
+  background: var(--row-hover);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* Modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.modal[hidden] {
+  display: none;
+}
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(2px);
+}
+
+.modal-card {
+  position: relative;
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+  max-width: 540px;
+  width: 100%;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.modal-body {
+  padding: 1rem 1.25rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.form-label {
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.form-input {
+  padding: 0.45rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  background: white;
+}
+
+.form-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-color: transparent;
+}
+
+.form-help {
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.form-help code {
+  background: var(--surface);
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+}
+
+.form-static {
+  padding: 0.3rem 0;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.form-static code {
+  background: var(--surface);
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.bulk-action {
+  margin-left: auto;
+  background: var(--accent);
+  color: white;
+  border: 1px solid var(--accent);
+  padding: 0.4rem 0.9rem;
+  font-weight: 500;
+}
+
+.bulk-action:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.bulk-action:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.link-button:hover {
+  background: var(--row-hover);
+  color: var(--accent-hover);
+}
+
+#status {
+  font-size: 0.875rem;
+  color: var(--muted);
+  margin: 0.5rem 0 1rem;
+  min-height: 1.2em;
+}
+
+/* Chat list */
+.chat-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.chat-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-row:last-child {
+  border-bottom: none;
+}
+
+.chat-row:hover {
+  background: var(--row-hover);
+}
+
+.chat-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-name {
+  font-weight: 500;
+  margin-bottom: 0.15rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-sub {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.chat-action {
+  flex-shrink: 0;
+}
+
+.empty {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+
+.error {
+  color: var(--danger);
+}
+
+/* Hidden attribute fix -- .actions { display: flex } was overriding the
+ * UA default of display:none for [hidden] elements. Make hidden actually hide. */
+.actions[hidden],
+.filters[hidden],
+.loadmore-row[hidden] {
+  display: none;
+}
+
+/* Dimmed rows for inaccessible items (e.g., meetings the user didn't organize) */
+.chat-row.dim {
+  opacity: 0.55;
+}
+
+
+
+.chat-row.dim .chat-action[disabled] {
+  cursor: not-allowed;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* Load more row */
+.loadmore-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 0.75rem;
+}
+
+.loadmore-row button {
+  min-width: 280px;
+}
+
+/* Filter row */
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  align-items: center;
+  margin: 0.5rem 0 0.75rem;
+  padding: 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.filters input[type="search"] {
+  flex: 1 1 200px;
+  min-width: 160px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: white;
+}
+
+.filters input[type="search"]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-color: transparent;
+}
+
+.chips {
+  display: inline-flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.chip:hover {
+  background: var(--row-hover);
+}
+
+.chip.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.chip.active:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.chip .chip-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.75rem;
+  opacity: 0.85;
+  background: rgba(255, 255, 255, 0.2);
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  min-width: 1.5rem;
+  text-align: center;
+}
+
+.chip:not(.active) .chip-count {
+  background: var(--bg);
+  color: var(--muted);
+}
+
+.chip.marked-only {
+  margin-left: auto;
+}
+
+.chip.marked-only.active {
+  background: #d97706;
+  border-color: #d97706;
+  color: white;
+}
+
+.sort-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.sort-label select {
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: white;
+}
+
+/* Star/mark toggle on each chat row */
+.mark-toggle {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  color: #c0c0c0;
+  transition: color 100ms, transform 100ms;
+}
+
+.mark-toggle:hover {
+  color: #f59e0b;
+  transform: scale(1.1);
+  background: transparent;
+}
+
+.mark-toggle.marked {
+  color: #f59e0b;
+}
+
+.chat-row.marked {
+  background: linear-gradient(to right, rgba(245, 158, 11, 0.06), transparent 80%);
+}
