@@ -11,6 +11,7 @@ import {
 import {
   listRecordings,
   formatDurationShort,
+  buildTranscriptFilename,
   type ChatType,
   type RecordingItem,
 } from "./sources/teams-call-recordings"
@@ -1474,8 +1475,9 @@ async function downloadRecordingTranscript(
       return false
     }
     button.textContent = "Saving…"
-    const stableName = recording.id.replace(/[^a-zA-Z0-9]/g, "")
-    const filename = `recording-transcript-${stableName}.md`
+    const account = msal.getActiveAccount()
+    const userOid = account?.localAccountId ?? null
+    const filename = buildTranscriptFilename(recording, userOid, ".md")
     const destination = userPrefs.destination
     let result: { saved: boolean; reason?: string; path?: string; webUrl?: string }
 

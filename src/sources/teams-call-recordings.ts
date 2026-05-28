@@ -342,6 +342,67 @@ export async function listRecordings(
   }
 }
 
+/** Build a human-readable, conflict-resistant filename for a recording's
+ * transcript file. Format: <YYYY-MM-DD>-<HHMM>-<subject>-<callIdShort>.<ext>
+ *
+ * The subject is derived from (in order):
+ *   1. chat topic, when set (scheduled meetings, named group chats)
+ *   2. "with <other person>" for 1:1 chats (skips self by oid)
+ *   3. the raw recording filename, stripped of its Teams-injected
+ *      "-YYYYMMDD_HHMMSS" suffix and ".mp4" extension
+ *
+ * Examples:
+ *   2026-05-26-1207-Marc-Catch-Up-6674e488.md       (scheduled meeting)
+ *   2026-05-26-1436-with-Diego-Colombo-91703f65.md  (1:1 ad-hoc call)
+ *   2026-05-21-0856-Show-and-Tell-MADE-fbc0311f.md  (chat-originated call)
+ *
+ * The 8-char callId suffix keeps it unique across same-subject calls without
+ * dominating the filename. Subject is capped at 60 chars after slugification.
+ */
+export function buildTranscriptFilename(
+  r: RecordingItem,
+  userOid: string | null,
+  extension: string,
+): string {
+  const d = new Date(r.eventCreatedDateTime)
+  const pad = (n: number) => String(n).padStart(2, "0")
+  const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  const timeStr = `${pad(d.getHours())}${pad(d.getMinutes())}`
+
+  let subject = ""
+  if (r.chatTopic && r.chatTopic.trim()) {
+    subject = r.chatTopic.trim()
+  } else if (r.chatType === "oneOnOne") {
+    const userOidLower = userOid ? userOid.toLowerCase() : null
+    const other = r.participants.find(
+      (p) =>
+        p.kind === "user" &&
+        p.displayName &&
+        !(userOidLower && p.id && p.id.toLowerCase() === userOidLower),
+    )
+    if (other) subject = `with ${other.displayName}`
+  }
+  if (!subject) {
+    subject = r.filename
+      .replace(/\.mp4$/i, "")
+      .replace(/[-_]Meeting[-_ ]Recording$/i, "")
+      .replace(/-\d{8}_\d{6}(UTC)?$/i, "")
+      .trim() ||
+      "recording"
+  }
+
+  const slug = subject
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/g, "") || "recording"
+
+  const shortId = r.callId.replace(/-/g, "").slice(0, 8) || "unknown"
+  const ext = extension.startsWith(".") ? extension : `.${extension}`
+
+  return `${dateStr}-${timeStr}-${slug}-${shortId}${ext}`
+}
+
 /** Parse ISO 8601 duration to seconds (best-effort, handles PT?H?M?S). */
 export function parseDurationSeconds(iso: string): number {
   if (!iso) return 0
