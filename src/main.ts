@@ -5,6 +5,7 @@ import {
   listChatsPage,
   fetchChatMessages,
   chatDisplayName,
+  buildChatArchiveFilename,
   type TeamsChatItem,
   type TeamsChatMessage,
 } from "./sources/teams-chats"
@@ -1345,9 +1346,14 @@ async function downloadChat(
     if (since) opts.since = since
     const messages = await fetchChatMessages(msal, chatId, opts)
     const destination = userPrefs.destination
-    const stableId = chatId.replace(/[^a-zA-Z0-9]/g, "")
-    const browserName = `teams-chat-${stableId}-${Date.now()}.json`
-    const onedriveName = `teams-chat-${stableId}.json`
+    const browserName = buildChatArchiveFilename(chatId, chatName, {
+      withTimestamp: true,
+      extension: ".json",
+    })
+    const onedriveName = buildChatArchiveFilename(chatId, chatName, {
+      withTimestamp: false,
+      extension: ".json",
+    })
     const nowIso = new Date().toISOString()
     const baseSnapshot = {
       source: "teams.chats",

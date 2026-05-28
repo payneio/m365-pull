@@ -172,6 +172,54 @@ export async function fetchChatMessages(
 }
 
 /** Best-effort display name for a chat. */
+/** Build a human-readable, conflict-resistant filename for a chat archive.
+ *
+ * - `withTimestamp: true` -> includes <YYYY-MM-DD>-<HHMM> prefix. Used for
+ *   browser saves (one file per download, never overwrites).
+ * - `withTimestamp: false` -> stable per chat. Used for OneDrive saves (the
+ *   cumulative-archive pattern relies on the same filename across downloads).
+ *
+ * The chatId is hashed to 8 hex chars (djb2, deterministic) for uniqueness
+ * without the 80+ chars of dashes-stripped chatId.
+ *
+ * Examples:
+ *   2026-05-27-1843-Marc-Goodner-a3f12b8c.json   (browser, 1:1)
+ *   Team-Pulse-Workstream-5d2e9f01.json          (OneDrive, named group)
+ */
+export function buildChatArchiveFilename(
+  chatId: string,
+  displayName: string,
+  options: { withTimestamp: boolean; extension: string },
+): string {
+  const slug =
+    (displayName || "chat")
+      .replace(/[^a-zA-Z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60)
+      .replace(/-+$/g, "") || "chat"
+
+  // djb2 hash of chatId -> 8 hex chars. Same input -> same output, so
+  // OneDrive's archive lookup stays stable across downloads.
+  let h = 5381
+  for (let i = 0; i < chatId.length; i++) {
+    h = ((h << 5) + h + chatId.charCodeAt(i)) | 0
+  }
+  const shortId = (h >>> 0).toString(16).padStart(8, "0")
+
+  const ext = options.extension.startsWith(".")
+    ? options.extension
+    : `.${options.extension}`
+
+  if (options.withTimestamp) {
+    const d = new Date()
+    const pad = (n: number) => String(n).padStart(2, "0")
+    const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    const time = `${pad(d.getHours())}${pad(d.getMinutes())}`
+    return `${date}-${time}-${slug}-${shortId}${ext}`
+  }
+  return `${slug}-${shortId}${ext}`
+}
+
 export function chatDisplayName(chat: TeamsChatItem): string {
   if (chat.topic) return chat.topic
   const members = (chat.members ?? [])
