@@ -220,6 +220,53 @@ export function buildChatArchiveFilename(
   return `${slug}-${shortId}${ext}`
 }
 
+/** Enrich each chat's `lastUpdatedDateTime` with the actual latest message
+ * timestamp from `/me/chats/{id}/messages`. Graph's chat-level field is
+ * known-stale: it doesn't bump for every new message (especially in 1:1s),
+ * so the list can show months-old dates for chats that were active yesterday.
+ *
+ * One $top=1 message fetch per chat. Run with a concurrency cap so we don't
+ * fire 50 requests at once. Failures (closed/archived chats) leave the
+ * original value in place rather than blocking the whole load.
+ */
+export async function enrichChatsWithLatestActivity(
+  msal: PublicClientApplication,
+  chats: TeamsChatItem[],
+  options: { concurrency?: number; onProgress?: (note: string) => void } = {},
+): Promise<TeamsChatItem[]> {
+  const concurrency = Math.max(1, options.concurrency ?? 5)
+  const out: TeamsChatItem[] = chats.map((c) => c)
+  let cursor = 0
+  let done = 0
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const idx = cursor++
+      if (idx >= chats.length) return
+      const chat = chats[idx]
+      try {
+        const path = `/me/chats/${encodeURIComponent(chat.id)}/messages?$top=1&$select=createdDateTime`
+        const resp = await graphGet<{ value: { createdDateTime?: string }[] }>(
+          msal,
+          path,
+          ["Chat.Read"],
+        )
+        const latest = resp.value?.[0]?.createdDateTime
+        if (latest && latest > chat.lastUpdatedDateTime) {
+          out[idx] = { ...chat, lastUpdatedDateTime: latest }
+        }
+      } catch {
+        // Leave the chat as-is on lookup failure.
+      }
+      done++
+      options.onProgress?.(`Verifying activity (${done}/${chats.length})\u2026`)
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  return out
+}
+
 export function chatDisplayName(chat: TeamsChatItem): string {
   if (chat.topic) return chat.topic
   const members = (chat.members ?? [])

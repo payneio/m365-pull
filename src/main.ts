@@ -6,8 +6,8 @@ import {
   fetchChatMessages,
   chatDisplayName,
   buildChatArchiveFilename,
+  enrichChatsWithLatestActivity,
   type TeamsChatItem,
-  type TeamsChatMessage,
 } from "./sources/teams-chats"
 import {
   listRecordings,
@@ -21,8 +21,9 @@ import {
   fetchRecordingTranscripts,
 } from "./sources/teams-recordings"
 import { vttToMarkdown } from "./format/transcript-markdown"
-import { saveAsJson, saveAsText } from "./destinations/browser"
-import { saveToOneDrive, saveTextToOneDrive, loadFromOneDrive } from "./destinations/onedrive"
+import { renderChatMarkdown } from "./format/chat-markdown"
+import { saveAsText } from "./destinations/browser"
+import { saveTextToOneDrive } from "./destinations/onedrive"
 import {
   loadUserPrefs,
   saveUserPrefs,
@@ -427,22 +428,6 @@ function applyRecordingFiltersAndSort(recordings: RecordingItem[]): RecordingIte
     })
   }
   return result
-}
-
-function mergeMessagesById(
-  oldMessages: TeamsChatMessage[],
-  newMessages: TeamsChatMessage[],
-): TeamsChatMessage[] {
-  const byId = new Map<string, TeamsChatMessage>()
-  for (const m of oldMessages) if (m.id) byId.set(m.id, m)
-  for (const m of newMessages) if (m.id) byId.set(m.id, m)
-  const merged = [...byId.values()]
-  merged.sort((a, b) => {
-    const at = a.createdDateTime ? Date.parse(a.createdDateTime) : 0
-    const bt = b.createdDateTime ? Date.parse(b.createdDateTime) : 0
-    return at - bt
-  })
-  return merged
 }
 
 // ----- Render -----
@@ -1087,6 +1072,18 @@ async function initialLoadChats(): Promise<void> {
     updateLoadMore()
     saveCachedChats(userKey, chatsState.chats, chatsState.nextCursor)
     showChatsRefreshButton()
+    // Graph's /me/chats lastUpdatedDateTime is unreliable -- it doesn't bump
+    // for every new message. Enrich with the real last-message timestamp by
+    // fetching $top=1 message per chat. Concurrent, with status updates.
+    setStatus(`Loaded ${page.chats.length} chats. Verifying activity dates…`)
+    const enriched = await enrichChatsWithLatestActivity(msal, chatsState.chats, {
+      concurrency: 5,
+      onProgress: (note) => setStatus(note),
+    })
+    chatsState = { chats: enriched, nextCursor: chatsState.nextCursor }
+    rerenderChatList()
+    saveCachedChats(userKey, chatsState.chats, chatsState.nextCursor)
+    setStatus(`${enriched.length} chats loaded (activity dates verified).`)
   } catch (err) {
     setStatus(
       `Refresh failed: ${(err as Error).message}${cached ? " — showing cached." : ""}`,
@@ -1105,7 +1102,11 @@ async function loadMoreChats(): Promise<void> {
   btn.textContent = "Loading more…"
   try {
     const page = await listChatsPage(msal, chatsState.nextCursor)
-    chatsState.chats = [...chatsState.chats, ...page.chats]
+    // Enrich just this page's chats with real last-activity timestamps
+    const enriched = await enrichChatsWithLatestActivity(msal, page.chats, {
+      concurrency: 5,
+    })
+    chatsState.chats = [...chatsState.chats, ...enriched]
     chatsState.nextCursor = page.nextCursor
     rerenderChatList()
     updateLoadMore()
@@ -1348,57 +1349,35 @@ async function downloadChat(
     const destination = userPrefs.destination
     const browserName = buildChatArchiveFilename(chatId, chatName, {
       withTimestamp: true,
-      extension: ".json",
+      extension: ".md",
     })
     const onedriveName = buildChatArchiveFilename(chatId, chatName, {
       withTimestamp: false,
-      extension: ".json",
+      extension: ".md",
     })
     const nowIso = new Date().toISOString()
-    const baseSnapshot = {
-      source: "teams.chats",
+    const chatType = chatsState.chats.find((c) => c.id === chatId)?.chatType ?? "chat"
+    const markdownBody = renderChatMarkdown(messages, {
+      title: chatName,
       chatId,
-      chatName,
-      lookback,
-      since: since?.toISOString() ?? null,
+      chatType,
       fetchedAt: nowIso,
-      messageCount: messages.length,
-      messages,
-    }
+      lookback,
+      sinceIso: since?.toISOString() ?? null,
+    })
 
     let result: { saved: boolean; reason?: string; path?: string; webUrl?: string }
-    let mergedTotal = messages.length
-    let newCount = messages.length
     if (destination === "onedrive") {
       const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${onedriveName}`
-      setStatus(
-        `${messages.length} messages fetched. Merging with existing archive at OneDrive (${userPrefs.oneDriveFolder})…`,
-      )
-      const existing = await loadFromOneDrive<{
-        messages?: TeamsChatMessage[]
-        firstDownloadAt?: string
-      }>(msal, fullPath)
-      const oldMessages = existing.found ? (existing.data?.messages ?? []) : []
-      const firstDownloadAt = existing.data?.firstDownloadAt ?? nowIso
-      const merged = mergeMessagesById(oldMessages, messages)
-      mergedTotal = merged.length
-      newCount = mergedTotal - oldMessages.length
-      const archive = {
-        source: "teams.chats",
-        chatId,
-        chatName,
-        schemaVersion: 2,
-        firstDownloadAt,
-        lastDownloadAt: nowIso,
-        lastLookback: lookback,
-        lastSince: since?.toISOString() ?? null,
-        messageCount: merged.length,
-        messages: merged,
-      }
-      result = await saveToOneDrive(msal, fullPath, archive)
+      setStatus(`${messages.length} messages fetched. Saving to OneDrive (${userPrefs.oneDriveFolder})…`)
+      result = await saveTextToOneDrive(msal, fullPath, markdownBody, "text/markdown")
     } else {
       setStatus(`${messages.length} messages fetched. Saving…`)
-      result = await saveAsJson(browserName, baseSnapshot)
+      result = await saveAsText(browserName, markdownBody, {
+        extension: ".md",
+        description: "Markdown",
+        mimeType: "text/markdown",
+      })
     }
 
     if (result.saved) {
@@ -1416,7 +1395,7 @@ async function downloadChat(
       if (destination === "onedrive") {
         const where = result.path ? `OneDrive (${result.path})` : "OneDrive"
         setStatus(
-          `✓ "${chatName}" archive updated in ${where}: +${newCount} new · ${mergedTotal} total${incrementalNote}.`,
+          `✓ Saved ${messages.length} messages from "${chatName}" to ${where}${incrementalNote}.`,
         )
       } else {
         setStatus(
