@@ -14,6 +14,9 @@ import type { PublicClientApplication } from "@azure/msal-browser"
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 const SCOPES = ["Chat.Read"]
+// Members listing requires ChatMember.Read (subset of Chat.Read in some tenants;
+// kept explicit so the token request is clear).
+
 
 export type ChatType = "oneOnOne" | "group" | "meeting"
 
@@ -273,6 +276,58 @@ export async function listRecordings(
   for (const rec of hits.values()) {
     const parts = participantsByCallId.get(rec.callId)
     if (parts) rec.participants = parts
+  }
+
+  // Phase 4: fallback for recordings without participants. 1:1 ad-hoc calls
+  // (not scheduled meetings) don't emit callEndedEventMessageDetail in their
+  // chat, so the join above produces nothing. Fall back to chat membership:
+  //   - For 1:1 chats this is exact (2 members = the user + 1 other)
+  //   - For group chats it's a superset of call attendance, but honest
+  //   - Members fetched once per unique chatId, attached to all that chat's recordings
+  const chatsNeedingFallback = new Set<string>()
+  for (const rec of hits.values()) {
+    if (rec.participants.length === 0) chatsNeedingFallback.add(rec.chatId)
+  }
+  if (chatsNeedingFallback.size > 0) {
+    onProgress?.(`Filling participants for ${chatsNeedingFallback.size} chats...`)
+    const membersByChat = new Map<string, Participant[]>()
+    for (const chatId of chatsNeedingFallback) {
+      try {
+        type MemberResponse = {
+          value: {
+            displayName?: string
+            userId?: string
+            email?: string
+          }[]
+        }
+        const resp: MemberResponse = await graphJson(
+          msal,
+          `/me/chats/${encodeURIComponent(chatId)}/members?$top=50`,
+          ["ChatMember.Read"],
+        )
+        const members: Participant[] = []
+        for (const m of resp.value ?? []) {
+          if (!m.displayName) continue
+          members.push({
+            displayName: m.displayName,
+            id: m.userId ?? null,
+            kind: "user",
+          })
+        }
+        membersByChat.set(chatId, members)
+      } catch (err) {
+        console.warn(
+          `[m365-pull] Failed to fetch members for chat ${chatId}:`,
+          err,
+        )
+      }
+    }
+    for (const rec of hits.values()) {
+      if (rec.participants.length === 0) {
+        const members = membersByChat.get(rec.chatId)
+        if (members && members.length > 0) rec.participants = members
+      }
+    }
   }
 
   const recordings = Array.from(hits.values()).sort((a, b) =>
