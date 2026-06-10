@@ -448,6 +448,24 @@ header {
   display: none;
 }
 
+/* Custom date range inputs — inline in the actions bar */
+.custom-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.actions input[type="date"] {
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: white;
+}
+
 /* Dimmed rows for inaccessible items (e.g., meetings the user didn't organize) */
 .chat-row.dim {
   opacity: 0.55;
