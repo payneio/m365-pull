@@ -153,8 +153,12 @@ async function graphJson<T>(
 }
 
 export interface ListRecordingsOptions {
-  /** Date window: return recordings whose event date falls within the last N days. */
-  daysBack: number
+  /** Start of the date window (ms since epoch, inclusive).
+   * Chats whose lastUpdatedDateTime is before this are skipped; recordings
+   * whose event date is before this are excluded. */
+  fromMs: number
+  /** End of the date window (ms since epoch, inclusive). Defaults to now. */
+  toMs?: number
   /** Cap chat pagination. Default 10 pages of 50 = up to 500 chats. */
   maxChatPages?: number
   /** Progress callback for UI status updates. */
@@ -162,12 +166,12 @@ export interface ListRecordingsOptions {
 }
 
 /**
- * Discover all call recordings the user has access to within the given date window.
+ * Discover all call recordings the user has access to within [fromMs, toMs].
  *
  * Algorithm:
  *   1. Page through /me/chats. Stop early once the oldest chat in a page is
- *      older than the window (chats are returned by lastUpdatedDateTime desc).
- *   2. Filter to chats active within the window.
+ *      older than fromMs (chats are returned by lastUpdatedDateTime desc).
+ *   2. Filter to chats whose lastUpdatedDateTime >= fromMs.
  *   3. For each such chat, fetch the most recent 50 messages.
  *   4. Extract messages where eventDetail.@odata.type is
  *      "#microsoft.graph.callRecordingEventMessageDetail", status is "success",
@@ -186,8 +190,8 @@ export async function listRecordings(
   msal: PublicClientApplication,
   options: ListRecordingsOptions,
 ): Promise<RecordingsResult> {
-  const { daysBack, maxChatPages = 10, onProgress } = options
-  const sinceMs = Date.now() - daysBack * 24 * 60 * 60 * 1000
+  const { fromMs, toMs, maxChatPages = 10, onProgress } = options
+  const untilMs = toMs ?? Date.now()
 
   // Phase 1: page through chats
   let chatsPath: string | null = "/me/chats?$top=50"
@@ -199,7 +203,7 @@ export async function listRecordings(
       await graphJson(msal, chatsPath, SCOPES)
     allChats.push(...page.value)
     const oldest = page.value[page.value.length - 1]?.lastUpdatedDateTime
-    if (oldest && new Date(oldest).getTime() < sinceMs) break
+    if (oldest && new Date(oldest).getTime() < fromMs) break
     chatsPath = page["@odata.nextLink"] ?? null
     pages++
   }
@@ -207,7 +211,7 @@ export async function listRecordings(
 
   const recentChats = allChats.filter((c) => {
     if (!c.lastUpdatedDateTime) return false
-    return new Date(c.lastUpdatedDateTime).getTime() >= sinceMs
+    return new Date(c.lastUpdatedDateTime).getTime() >= fromMs
   })
 
   // Phase 2: scan messages in each recent chat. Collect both:
@@ -240,7 +244,8 @@ export async function listRecordings(
           // (e.g. a sparse 1:1 that was recently active but whose last 50
           // messages span years).  m.createdDateTime is the timestamp of
           // the recording event itself, not the chat's lastUpdatedDateTime.
-          if (new Date(m.createdDateTime).getTime() < sinceMs) continue
+          const recMs = new Date(m.createdDateTime).getTime()
+          if (recMs < fromMs || recMs > untilMs) continue
           const callId = ed.callId ?? "(no-callid)"
           const filename = ed.callRecordingDisplayName ?? "(unnamed)"
           const id = `${callId}::${filename}`

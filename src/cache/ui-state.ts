@@ -9,8 +9,6 @@ export interface UIState {
   currentSource?: string
   /** Chats source: lookback dropdown value */
   lookback?: string
-  /** Transcripts source: daysBack dropdown value (number-as-string) */
-  daysBack?: string
   chatFilter?: {
     search: string
     enabledTypes: string[]

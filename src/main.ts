@@ -49,6 +49,7 @@ import {
   type AppState,
   type ChatPrefs,
   type RecordingPrefs,
+  type RecordingRange,
 } from "./state/onedrive-state"
 
 const app = document.getElementById("app") as HTMLDivElement
@@ -82,7 +83,6 @@ interface ChatsState {
 
 interface RecordingsState {
   recordings: RecordingItem[]
-  daysBack: number
   chatsScanned: number
   truncated: boolean
 }
@@ -127,7 +127,7 @@ const SIGNIN_SCOPES = [
 
 let currentSource: SourceId = "teams.chats"
 let chatsState: ChatsState = { chats: [], nextCursor: null }
-let recordingsState: RecordingsState = { recordings: [], daysBack: 90, chatsScanned: 0, truncated: false }
+let recordingsState: RecordingsState = { recordings: [], chatsScanned: 0, truncated: false }
 let filterState: FilterState = {
   search: "",
   enabledTypes: new Set(KNOWN_TYPES.map((t) => t.id)),
@@ -179,6 +179,67 @@ function formatDateShort(d: Date): string {
   })
 }
 
+// ----- Recording range helpers -----
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/** Format a Date as "yyyy-mm-dd" in local time for date inputs. */
+function toLocalDateString(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** Midnight (00:00:00.000) of the most recent Monday in local time. */
+function startOfThisWeekMonday(): number {
+  const now = new Date()
+  const dayOfWeek = now.getDay() // 0=Sun, 1=Mon, … 6=Sat
+  const daysSinceMonday = (dayOfWeek + 6) % 7
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysSinceMonday).getTime()
+}
+
+/** Midnight (00:00:00.000) of a yyyy-mm-dd date in local time. */
+function startOfLocalDay(yyyyMmDd: string): number {
+  const [y, m, d] = yyyyMmDd.split("-").map(Number)
+  return new Date(y, m - 1, d, 0, 0, 0, 0).getTime()
+}
+
+/** 23:59:59.999 of a yyyy-mm-dd date in local time. */
+function endOfLocalDay(yyyyMmDd: string): number {
+  const [y, m, d] = yyyyMmDd.split("-").map(Number)
+  return new Date(y, m - 1, d, 23, 59, 59, 999).getTime()
+}
+
+/** Map a persisted RecordingRange to a concrete [fromMs, toMs] window. */
+function computeRecordingWindow(range: RecordingRange): { fromMs: number; toMs: number } {
+  const now = Date.now()
+  switch (range.kind) {
+    case "this-week":
+      return { fromMs: startOfThisWeekMonday(), toMs: now }
+    case "last-7d":
+      return { fromMs: now - 7 * DAY_MS, toMs: now }
+    case "last-30d":
+      return { fromMs: now - 30 * DAY_MS, toMs: now }
+    case "custom": {
+      const fromMs = range.customFrom ? startOfLocalDay(range.customFrom) : now - 7 * DAY_MS
+      const toMs = range.customTo ? endOfLocalDay(range.customTo) : now
+      return { fromMs, toMs }
+    }
+  }
+}
+
+/** Human-readable label for a RecordingRange (used in status messages). */
+function rangeLabel(range: RecordingRange): string {
+  switch (range.kind) {
+    case "this-week": return "this week"
+    case "last-7d": return "last 7 days"
+    case "last-30d": return "last 30 days"
+    case "custom":
+      if (range.customFrom && range.customTo) return `${range.customFrom} to ${range.customTo}`
+      if (range.customFrom) return `from ${range.customFrom}`
+      return "custom range"
+  }
+}
+
 function setStatus(text: string, kind: "info" | "error" = "info"): void {
   const status = el<HTMLDivElement>("status")
   status.textContent = text
@@ -204,6 +265,23 @@ function syncUserPrefsToUI(): void {
     | null
   if (folderEl) folderEl.hidden = userPrefs.destination !== "onedrive"
   if (editBtn) editBtn.textContent = userPrefs.oneDriveFolder
+
+  // Recording range
+  const range: RecordingRange = userPrefs.recordingRange ?? { kind: "last-7d" }
+  const rangeEl = document.getElementById("recording-range") as HTMLSelectElement | null
+  if (rangeEl) rangeEl.value = range.kind
+  const customEl = document.getElementById("custom-range-inputs") as HTMLSpanElement | null
+  if (customEl) customEl.hidden = range.kind !== "custom"
+  if (range.kind === "custom") {
+    const fromEl = document.getElementById("recording-from") as HTMLInputElement | null
+    const toEl = document.getElementById("recording-to") as HTMLInputElement | null
+    if (fromEl && range.customFrom) fromEl.value = range.customFrom
+    if (toEl && range.customTo) toEl.value = range.customTo
+  }
+
+  // Hide-downloaded toggle
+  const hideBtn = document.getElementById("hide-downloaded") as HTMLButtonElement | null
+  if (hideBtn) hideBtn.classList.toggle("active", !!userPrefs.hideDownloaded)
 }
 
 function typeLabel(type: string): string {
@@ -405,6 +483,8 @@ function applyRecordingFiltersAndSort(recordings: RecordingItem[]): RecordingIte
   let result = recordings.filter((r) => {
     if (recordingFilterState.markedOnly && !markedIds.has(r.id)) return false
     if (!recordingFilterState.enabledKinds.has(r.chatType)) return false
+    // Hide-downloaded: exclude recordings whose lastSync is set (same field the row indicator uses)
+    if (userPrefs.hideDownloaded && recordingPrefs[r.id]?.lastSync) return false
     if (q) {
       const haystack = `${r.filename} ${r.chatTopic ?? ""}`.toLowerCase()
       if (!haystack.includes(q)) return false
@@ -536,13 +616,18 @@ function render(): void {
       <div class="actions" id="actions-transcripts" hidden>
         <button id="load-recordings" class="primary">Load my recordings</button>
         <button id="refresh-recordings" hidden>Refresh</button>
-        <span class="label">Window:</span>
-        <select id="daysback" title="How far back to search the calendar">
-          <option value="7">Last 7 days</option>
-          <option value="30">Last 30 days</option>
-          <option value="90" selected>Last 90 days</option>
-          <option value="365">Last year</option>
+        <span class="label">Range:</span>
+        <select id="recording-range" title="Date range for recordings">
+          <option value="this-week">This week</option>
+          <option value="last-7d" selected>Last 7 days</option>
+          <option value="last-30d">Last 30 days</option>
+          <option value="custom">Custom range\u2026</option>
         </select>
+        <span id="custom-range-inputs" class="custom-range" hidden>
+          <input type="date" id="recording-from" title="From (inclusive)" />
+          <span class="label">to</span>
+          <input type="date" id="recording-to" title="To (inclusive)" />
+        </span>
         <button id="bulk-recordings" class="bulk-action" hidden></button>
       </div>
 
@@ -581,6 +666,7 @@ function render(): void {
           </select>
         </label>
         <button class="chip marked-only" id="markedonly-recordings">★ Marked only</button>
+        <button class="chip" id="hide-downloaded">Hide downloaded</button>
       </div>
       <div id="status"></div>
       <ul id="chats" class="chat-list"></ul>
@@ -640,9 +726,58 @@ function wireGlobalHandlers(account: AccountInfo): void {
   el<HTMLButtonElement>("bulk-recordings").addEventListener("click", () => {
     void bulkDownloadRecordings()
   })
-  el<HTMLSelectElement>("daysback").addEventListener("change", (e) => {
-    recordingsState.daysBack = parseInt((e.target as HTMLSelectElement).value, 10) || 90
-    saveUIPrefs()
+  // Recording range dropdown + custom date inputs — persisted to OneDrive userPrefs
+  el<HTMLSelectElement>("recording-range").addEventListener("change", () => {
+    const kind = el<HTMLSelectElement>("recording-range").value as RecordingRange["kind"]
+    const customEl = el<HTMLSpanElement>("custom-range-inputs")
+    customEl.hidden = kind !== "custom"
+    if (kind === "custom") {
+      // Default date inputs when first revealed
+      const fromEl = el<HTMLInputElement>("recording-from")
+      const toEl = el<HTMLInputElement>("recording-to")
+      if (!fromEl.value) fromEl.value = toLocalDateString(new Date(Date.now() - 7 * DAY_MS))
+      if (!toEl.value) toEl.value = toLocalDateString(new Date())
+      userPrefs = { ...userPrefs, recordingRange: {
+        kind,
+        customFrom: fromEl.value || undefined,
+        customTo: toEl.value || undefined,
+      } }
+    } else {
+      userPrefs = { ...userPrefs, recordingRange: { kind } }
+    }
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    // If recordings have already been loaded, reload with the new range
+    if (!el<HTMLButtonElement>("refresh-recordings").hidden) {
+      void refreshRecordings()
+    }
+  })
+
+  const applyCustomRange = () => {
+    const fromEl = document.getElementById("recording-from") as HTMLInputElement | null
+    const toEl = document.getElementById("recording-to") as HTMLInputElement | null
+    userPrefs = { ...userPrefs, recordingRange: {
+      kind: "custom",
+      customFrom: fromEl?.value || undefined,
+      customTo: toEl?.value || undefined,
+    } }
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    // If recordings have already been loaded, reload with the new range
+    if (!el<HTMLButtonElement>("refresh-recordings").hidden) {
+      void refreshRecordings()
+    }
+  }
+  el<HTMLInputElement>("recording-from").addEventListener("change", applyCustomRange)
+  el<HTMLInputElement>("recording-to").addEventListener("change", applyCustomRange)
+
+  el<HTMLButtonElement>("hide-downloaded").addEventListener("click", () => {
+    const next = !userPrefs.hideDownloaded
+    userPrefs = { ...userPrefs, hideDownloaded: next }
+    el<HTMLButtonElement>("hide-downloaded").classList.toggle("active", next)
+    saveUserPrefs(userCacheKey(), userPrefs)
+    scheduleOneDriveSave()
+    rerenderRecordingsList()
   })
 
   // Chat lookback dropdown persists too
@@ -805,13 +940,9 @@ function saveUIPrefs(): void {
   const lookbackEl = document.getElementById("lookback") as
     | HTMLSelectElement
     | null
-  const daysbackEl = document.getElementById("daysback") as
-    | HTMLSelectElement
-    | null
   saveUIState(userCacheKey(), {
     currentSource,
     lookback: lookbackEl?.value,
-    daysBack: daysbackEl?.value,
     chatFilter: {
       search: filterState.search,
       enabledTypes: [...filterState.enabledTypes],
@@ -856,10 +987,6 @@ function hydrateUIStateFromStorage(): void {
       markedOnly: saved.recordingFilter.markedOnly ?? false,
     }
   }
-  if (saved.daysBack) {
-    const n = parseInt(saved.daysBack, 10)
-    if (Number.isFinite(n) && n > 0) recordingsState.daysBack = n
-  }
   // Note: lookback dropdown value is restored in syncUIControlsFromState
   // (called after handlers are wired and the DOM is interactive).
 }
@@ -874,9 +1001,7 @@ function syncUIControlsFromState(): void {
   // Chat lookback
   const lookbackEl = document.getElementById("lookback") as HTMLSelectElement | null
   if (lookbackEl && saved.lookback) lookbackEl.value = saved.lookback
-  // Meeting daysBack
-  const daysbackEl = document.getElementById("daysback") as HTMLSelectElement | null
-  if (daysbackEl) daysbackEl.value = String(recordingsState.daysBack)
+  // Recording range is synced via syncUserPrefsToUI (called from wireGlobalHandlers)
   // Chat filter UI: search, sortby, type chips, markedonly
   const searchEl = document.getElementById("search") as HTMLInputElement | null
   if (searchEl) searchEl.value = filterState.search
@@ -1257,12 +1382,13 @@ function updateRecordingsSummary(): void {
   const filtered = applyRecordingFiltersAndSort(recordingsState.recordings).length
   const marked = recordingsState.recordings.filter((r) => markedIds.has(r.id)).length
   const { chatsScanned, truncated } = recordingsState
+  const label = rangeLabel(userPrefs.recordingRange ?? { kind: "last-7d" })
   if (n === 0) {
-    setStatus(`No recordings in last ${recordingsState.daysBack} days. Widen the window.`)
+    setStatus(`No recordings for ${label}. Widen the window.`)
   } else if (filtered < n) {
     setStatus(`Showing ${filtered} of ${n} · ${marked} marked · from ${chatsScanned} chat(s)${truncated ? " · (chat list truncated — narrow window or add pagination)" : ""}`)
   } else {
-    setStatus(`${n} recording(s) from ${chatsScanned} chat(s) (last ${recordingsState.daysBack} days) · ${marked} marked${truncated ? " · (chat list truncated — narrow window or add pagination)" : ""}`)
+    setStatus(`${n} recording(s) from ${chatsScanned} chat(s) (${label}) · ${marked} marked${truncated ? " · (chat list truncated — narrow window or add pagination)" : ""}`)
   }
 }
 
@@ -1278,8 +1404,11 @@ async function initialLoadRecordings(): Promise<void> {
   loadBtn.disabled = true
   loadBtn.textContent = "Loading…"
   try {
+    const range: RecordingRange = userPrefs.recordingRange ?? { kind: "last-7d" }
+    const { fromMs, toMs } = computeRecordingWindow(range)
     const result = await listRecordings(msal, {
-      daysBack: recordingsState.daysBack,
+      fromMs,
+      toMs,
       onProgress: (note) => setStatus(note),
     })
     recordingsState.recordings = result.recordings
@@ -1296,7 +1425,7 @@ async function initialLoadRecordings(): Promise<void> {
 }
 
 async function refreshRecordings(): Promise<void> {
-  recordingsState = { recordings: [], daysBack: recordingsState.daysBack, chatsScanned: 0, truncated: false }
+  recordingsState = { recordings: [], chatsScanned: 0, truncated: false }
   el<HTMLUListElement>("recordings").innerHTML = ""
   await initialLoadRecordings()
 }

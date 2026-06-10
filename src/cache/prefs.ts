@@ -3,7 +3,7 @@
 // just provides instant access on page load before the OneDrive pull lands.
 
 import type { UserPrefs } from "../state/onedrive-state"
-export type { UserPrefs, Destination } from "../state/onedrive-state"
+export type { UserPrefs, Destination, RecordingRange } from "../state/onedrive-state"
 
 const KEY_PREFIX = "m365-pull.userPrefs.v1."
 
@@ -24,6 +24,8 @@ export function loadUserPrefs(userKey: string): UserPrefs {
     return {
       destination: data.destination ?? DEFAULTS.destination,
       oneDriveFolder: data.oneDriveFolder ?? DEFAULTS.oneDriveFolder,
+      ...(data.recordingRange !== undefined ? { recordingRange: data.recordingRange } : {}),
+      ...(data.hideDownloaded !== undefined ? { hideDownloaded: data.hideDownloaded } : {}),
     }
   } catch {
     return { ...DEFAULTS }
