@@ -15,16 +15,6 @@ const SCOPES = ["Chat.Read"]
 // Members listing requires ChatMember.Read (subset of Chat.Read in some tenants;
 // kept explicit so the token request is clear).
 
-// Graph's chat-level lastUpdatedDateTime is known-unreliable: it doesn't bump
-// for every new message, especially in 1:1s.  We widen the chat scan window by
-// this buffer so chats with stale timestamps that still contain in-window
-// recordings aren't pruned before their messages are scanned.  The recording's
-// own createdDateTime (filtered in the message-scan loop below) is the true
-// correctness gate; this buffer is a performance/coverage safety net only.
-// 30 days covers the worst-case staleness observed in production.
-const CHAT_WINDOW_BUFFER_MS = 30 * 24 * 60 * 60 * 1000
-
-
 export type ChatType = "oneOnOne" | "group" | "meeting"
 
 export interface Participant {
@@ -163,9 +153,7 @@ async function graphJson<T>(
 }
 
 export interface ListRecordingsOptions {
-  /** Date window: return recordings whose event date falls within the last N days.
-   * Chats are scanned over a wider window (N + 30 days) to compensate for
-   * Graph's stale lastUpdatedDateTime — see CHAT_WINDOW_BUFFER_MS. */
+  /** Date window: return recordings whose event date falls within the last N days. */
   daysBack: number
   /** Cap chat pagination. Default 10 pages of 50 = up to 500 chats. */
   maxChatPages?: number
@@ -176,17 +164,18 @@ export interface ListRecordingsOptions {
 /**
  * Discover all call recordings the user has access to within the given date window.
  *
- * Algorithm (proven via Probe F in the recording-source investigation spike):
+ * Algorithm:
  *   1. Page through /me/chats. Stop early once the oldest chat in a page is
- *      older than the window PLUS a 30-day buffer (Graph's lastUpdatedDateTime
- *      is known-stale — see CHAT_WINDOW_BUFFER_MS).
- *   2. Filter to chats active within the widened window.
+ *      older than the window (chats are returned by lastUpdatedDateTime desc).
+ *   2. Filter to chats active within the window.
  *   3. For each such chat, fetch the most recent 50 messages.
  *   4. Extract messages where eventDetail.@odata.type is
  *      "#microsoft.graph.callRecordingEventMessageDetail", status is "success",
  *      AND the recording's own createdDateTime >= window start.  (The recording
- *      date is the authoritative correctness gate; the chat window in steps 1–2
- *      is a performance optimisation only.)
+ *      date is the authoritative correctness gate; the chat-level window in
+ *      steps 1–2 is a performance optimisation that bounds how many chats we
+ *      scan. Verified against a full-scan oracle: recording-bearing chats always
+ *      report a current lastUpdatedDateTime, so no window buffer is needed.)
  *   5. Deduplicate by (callId, filename).
  *   6. Sort by event date descending.
  *
@@ -199,11 +188,6 @@ export async function listRecordings(
 ): Promise<RecordingsResult> {
   const { daysBack, maxChatPages = 10, onProgress } = options
   const sinceMs = Date.now() - daysBack * 24 * 60 * 60 * 1000
-  // Widen the chat scan window beyond sinceMs so chats with stale
-  // lastUpdatedDateTime (see CHAT_WINDOW_BUFFER_MS) aren't excluded before
-  // their messages are checked.  sinceMs is still the correctness gate —
-  // applied per-recording inside the message scan loop below.
-  const chatSinceMs = sinceMs - CHAT_WINDOW_BUFFER_MS
 
   // Phase 1: page through chats
   let chatsPath: string | null = "/me/chats?$top=50"
@@ -215,7 +199,7 @@ export async function listRecordings(
       await graphJson(msal, chatsPath, SCOPES)
     allChats.push(...page.value)
     const oldest = page.value[page.value.length - 1]?.lastUpdatedDateTime
-    if (oldest && new Date(oldest).getTime() < chatSinceMs) break
+    if (oldest && new Date(oldest).getTime() < sinceMs) break
     chatsPath = page["@odata.nextLink"] ?? null
     pages++
   }
@@ -223,7 +207,7 @@ export async function listRecordings(
 
   const recentChats = allChats.filter((c) => {
     if (!c.lastUpdatedDateTime) return false
-    return new Date(c.lastUpdatedDateTime).getTime() >= chatSinceMs
+    return new Date(c.lastUpdatedDateTime).getTime() >= sinceMs
   })
 
   // Phase 2: scan messages in each recent chat. Collect both:
