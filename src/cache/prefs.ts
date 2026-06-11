@@ -28,6 +28,7 @@ export function loadUserPrefs(userKey: string): UserPrefs {
       ...(data.chatRange !== undefined ? { chatRange: data.chatRange } : {}),
       ...(data.markedInclude !== undefined ? { markedInclude: data.markedInclude } : {}),
       ...(data.hideDownloaded !== undefined ? { hideDownloaded: data.hideDownloaded } : {}),
+      ...(data.recordingMarkedInclude !== undefined ? { recordingMarkedInclude: data.recordingMarkedInclude } : {}),
     }
   } catch {
     return { ...DEFAULTS }

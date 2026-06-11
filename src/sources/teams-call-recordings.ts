@@ -1,9 +1,17 @@
 // Call recordings source -- discovers recordings by walking /me/chats and
 // extracting callRecordingEventMessageDetail events.
 //
-// Catches scheduled meetings, 1:1 calls, group-chat calls, and recordings
-// stored in any accessible OneDrive -- every recording the signed-in user
-// has access to, identified by a direct SharePoint URL in the event payload.
+// Deep message scan: each qualifying chat's messages are paginated until the
+// oldest message predates the window (createdDateTime < fromMs), not capped at
+// 50. A probe confirmed the old top-50 fetch silently missed 11 of 38
+// in-window recordings -- whole chats were invisible. Deep scan is mandatory
+// for "sync ALL" to be true.
+//
+// Per-chat page cap: 30 pages (~1500 msgs). If a chat hits the cap before
+// reaching the window edge, container.truncated is set to true and surfaced
+// in the UI -- we never silently stop.
+//
+// Concurrency: ~4 chat scans run in parallel, keeping total latency reasonable.
 //
 // Transcript fetching uses the SharePoint REST v2.1 path in teams-recordings.ts
 // (Graph /shares -> driveItem -> _api/v2.1 with media/transcripts expansion).
@@ -55,8 +63,26 @@ export interface RecordingItem {
   participants: Participant[]
 }
 
-export interface RecordingsResult {
+/** A chat container grouping all in-window recordings from one chat. */
+export interface RecordingContainer {
+  /** Chat that owns these recordings. */
+  chatId: string
+  /** Chat topic (null for 1:1s and unnamed group chats). */
+  chatTopic: string | null
+  /** "oneOnOne" | "group" | "meeting". */
+  chatType: ChatType
+  /** All recordings from this chat that fall within the scan window. Sorted
+   * by eventCreatedDateTime descending (newest first). */
   recordings: RecordingItem[]
+  /** True when this chat's message scan hit the per-chat page cap before
+   * reaching the window edge. Some in-window recordings may be missing.
+   * Surfaced loudly in the UI -- never silent. */
+  truncated: boolean
+}
+
+export interface RecordingsResult {
+  /** One container per chat that had >=1 in-window recording. */
+  containers: RecordingContainer[]
   /** Number of chats whose messages we actually scanned. */
   chatsScanned: number
   /** True if we hit the chat-paging cap and there may be more chats unread. */
@@ -133,23 +159,43 @@ async function getGraphToken(
   return r.accessToken
 }
 
+/** Graph GET with retry: honors Retry-After on 429, exponential backoff on
+ * 502/503/504. Up to 5 retries before throwing. Refreshes token each attempt
+ * so stale tokens don't block long-running paginated scans. */
 async function graphJson<T>(
   msal: PublicClientApplication,
   path: string,
   scopes: string[],
 ): Promise<T> {
   const url = path.startsWith("http") ? path : `${GRAPH_BASE}${path}`
-  const token = await getGraphToken(msal, scopes)
-  const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  if (!resp.ok) {
+  const MAX_RETRIES = 5
+  let retryDelay = 1000
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const token = await getGraphToken(msal, scopes)
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (resp.ok) return resp.json() as Promise<T>
+    if (
+      attempt < MAX_RETRIES &&
+      (resp.status === 429 || resp.status === 502 || resp.status === 503 || resp.status === 504)
+    ) {
+      const ra = resp.headers.get("Retry-After")
+      const wait = ra
+        ? Math.min(parseInt(ra, 10) * 1000, 60_000)
+        : retryDelay + Math.random() * retryDelay
+      await new Promise<void>((resolve) => setTimeout(resolve, wait))
+      retryDelay = Math.min(retryDelay * 2, 30_000)
+      continue
+    }
     const body = await resp.text()
     throw new Error(
       `Graph ${path}: ${resp.status} ${resp.statusText} \u2014 ${body.slice(0, 300)}`,
     )
   }
-  return resp.json() as Promise<T>
+  // All retries exhausted -- this path is unreachable due to the throw above,
+  // but TypeScript requires a return/throw after the loop.
+  throw new Error(`Graph ${path}: max retries exceeded`)
 }
 
 export interface ListRecordingsOptions {
@@ -161,6 +207,10 @@ export interface ListRecordingsOptions {
   toMs?: number
   /** Cap chat pagination. Default 10 pages of 50 = up to 500 chats. */
   maxChatPages?: number
+  /** Cap per-chat message page scans. Default 30 pages (~1500 msgs).
+   * If a chat hits this cap before reaching the window edge, the container
+   * gets truncated=true and the UI shows a loud warning. Never silent. */
+  maxMsgPagesPerChat?: number
   /** Progress callback for UI status updates. */
   onProgress?: (note: string) => void
 }
@@ -172,16 +222,18 @@ export interface ListRecordingsOptions {
  *   1. Page through /me/chats. Stop early once the oldest chat in a page is
  *      older than fromMs (chats are returned by lastUpdatedDateTime desc).
  *   2. Filter to chats whose lastUpdatedDateTime >= fromMs.
- *   3. For each such chat, fetch the most recent 50 messages.
+ *   3. For each such chat, page through messages (newest-first) until
+ *      createdDateTime < fromMs (window edge) or the per-chat page cap is hit.
+ *      If the cap fires before the edge, container.truncated = true.
  *   4. Extract messages where eventDetail.@odata.type is
  *      "#microsoft.graph.callRecordingEventMessageDetail", status is "success",
- *      AND the recording's own createdDateTime >= window start.  (The recording
- *      date is the authoritative correctness gate; the chat-level window in
- *      steps 1–2 is a performance optimisation that bounds how many chats we
- *      scan. Verified against a full-scan oracle: recording-bearing chats always
- *      report a current lastUpdatedDateTime, so no window buffer is needed.)
- *   5. Deduplicate by (callId, filename).
- *   6. Sort by event date descending.
+ *      AND the recording's own createdDateTime is within [fromMs, toMs].
+ *   5. Also collect callEndedEventMessageDetail events to get participant lists.
+ *   6. Chats are scanned in a concurrency pool of ~4.
+ *   7. Deduplicate recordings by (callId, filename) within each chat.
+ *   8. Group recordings by chatId into RecordingContainer objects.
+ *   9. Join participants by callId; fall back to chat membership for 1:1s
+ *      and group chats with no callEnded event.
  *
  * Catches scheduled meetings, 1:1 calls, group-chat calls, multi-recording calls,
  * and recordings stored in others' OneDrives. No calendar lookup, no search.
@@ -190,98 +242,141 @@ export async function listRecordings(
   msal: PublicClientApplication,
   options: ListRecordingsOptions,
 ): Promise<RecordingsResult> {
-  const { fromMs, toMs, maxChatPages = 10, onProgress } = options
+  const {
+    fromMs,
+    toMs,
+    maxChatPages = 10,
+    maxMsgPagesPerChat = 30,
+    onProgress,
+  } = options
   const untilMs = toMs ?? Date.now()
 
-  // Phase 1: page through chats
+  // Phase 1: page through chats (unchanged from prior implementation)
   let chatsPath: string | null = "/me/chats?$top=50"
   const allChats: ChatListItem[] = []
-  let pages = 0
-  while (chatsPath && pages < maxChatPages) {
-    onProgress?.(`Listing chats (page ${pages + 1})\u2026`)
+  let chatPages = 0
+  while (chatsPath && chatPages < maxChatPages) {
+    onProgress?.(`Listing chats (page ${chatPages + 1})\u2026`)
     const page: { value: ChatListItem[]; "@odata.nextLink"?: string } =
       await graphJson(msal, chatsPath, SCOPES)
     allChats.push(...page.value)
     const oldest = page.value[page.value.length - 1]?.lastUpdatedDateTime
     if (oldest && new Date(oldest).getTime() < fromMs) break
     chatsPath = page["@odata.nextLink"] ?? null
-    pages++
+    chatPages++
   }
-  const truncated = chatsPath !== null && pages >= maxChatPages
+  const truncated = chatsPath !== null && chatPages >= maxChatPages
 
   const recentChats = allChats.filter((c) => {
     if (!c.lastUpdatedDateTime) return false
     return new Date(c.lastUpdatedDateTime).getTime() >= fromMs
   })
 
-  // Phase 2: scan messages in each recent chat. Collect both:
-  //   - callRecordingEventMessageDetail with status:"success" -> recordings
-  //   - callEndedEventMessageDetail                            -> participants by callId
-  // Join client-side -- a single chat carries both event types for a given call.
+  // Phase 2: deep message scan -- paginate each chat until window edge or cap.
+  // Shared accumulators (single JS thread, no actual races at await points).
   const hits = new Map<string, RecordingItem>()
   const participantsByCallId = new Map<string, Participant[]>()
-  for (let i = 0; i < recentChats.length; i++) {
-    const chat = recentChats[i]
-    onProgress?.(`Scanning chat ${i + 1}/${recentChats.length}\u2026`)
+  const chatTruncatedSet = new Set<string>()
+  let progressDone = 0
+
+  async function scanChat(chat: ChatListItem): Promise<void> {
+    let msgPath: string | null =
+      `/me/chats/${encodeURIComponent(chat.id)}/messages?$top=50`
+    let msgPages = 0
+    let passedWindowEdge = false
+
     try {
-      const msgs: { value: ChatMessage[] } = await graphJson(
-        msal,
-        `/me/chats/${encodeURIComponent(chat.id)}/messages?$top=50`,
-        SCOPES,
-      )
-      for (const m of msgs.value) {
-        const ed = m.eventDetail
-        if (!ed) continue
-        const t = ed["@odata.type"]
-        if (
-          t === "#microsoft.graph.callRecordingEventMessageDetail" &&
-          ed.callRecordingStatus === "success" &&
-          ed.callRecordingUrl
-        ) {
-          // Part 1: filter by the recording's own date — the authoritative
-          // window gate.  Without this, a recording event from years ago
-          // appears whenever its chat passes the chat-level activity filter
-          // (e.g. a sparse 1:1 that was recently active but whose last 50
-          // messages span years).  m.createdDateTime is the timestamp of
-          // the recording event itself, not the chat's lastUpdatedDateTime.
-          const recMs = new Date(m.createdDateTime).getTime()
-          if (recMs < fromMs || recMs > untilMs) continue
-          const callId = ed.callId ?? "(no-callid)"
-          const filename = ed.callRecordingDisplayName ?? "(unnamed)"
-          const id = `${callId}::${filename}`
-          if (!hits.has(id)) {
-            hits.set(id, {
-              id,
-              callId,
-              filename,
-              url: ed.callRecordingUrl,
-              durationIso: ed.callRecordingDuration ?? "",
-              organizerOid: ed.meetingOrganizer?.user?.id ?? null,
-              initiatorOid: ed.initiator?.user?.id ?? null,
-              eventCreatedDateTime: m.createdDateTime,
-              chatId: chat.id,
-              chatTopic: chat.topic,
-              chatType: chat.chatType,
-              participants: [],
-            })
+      while (msgPath !== null && msgPages < maxMsgPagesPerChat) {
+        const msgPage: { value: ChatMessage[]; "@odata.nextLink"?: string } =
+          await graphJson(msal, msgPath, SCOPES)
+        msgPages++
+
+        for (const m of msgPage.value) {
+          const msgMs = new Date(m.createdDateTime).getTime()
+          // Messages are newest-first. Once we're past the window edge, stop.
+          if (msgMs < fromMs) {
+            passedWindowEdge = true
+            break
           }
-        } else if (
-          t === "#microsoft.graph.callEndedEventMessageDetail" &&
-          ed.callId
-        ) {
-          // Latest participants list wins (later messages overwrite earlier).
-          // For the same call, all callEnded events should carry the same list,
-          // but we keep the last-seen one to be defensive about Teams variations.
-          const parts = extractParticipants(ed.callParticipants)
-          if (parts.length > 0) {
-            participantsByCallId.set(ed.callId, parts)
+          // Skip messages above the upper bound (custom ranges with a past
+          // end date -- the newest messages are too recent for the window).
+          if (msgMs > untilMs) continue
+
+          const ed = m.eventDetail
+          if (!ed) continue
+          const t = ed["@odata.type"]
+
+          if (
+            t === "#microsoft.graph.callRecordingEventMessageDetail" &&
+            ed.callRecordingStatus === "success" &&
+            ed.callRecordingUrl
+          ) {
+            const callId = ed.callId ?? "(no-callid)"
+            const filename = ed.callRecordingDisplayName ?? "(unnamed)"
+            const id = `${callId}::${filename}`
+            if (!hits.has(id)) {
+              hits.set(id, {
+                id,
+                callId,
+                filename,
+                url: ed.callRecordingUrl,
+                durationIso: ed.callRecordingDuration ?? "",
+                organizerOid: ed.meetingOrganizer?.user?.id ?? null,
+                initiatorOid: ed.initiator?.user?.id ?? null,
+                eventCreatedDateTime: m.createdDateTime,
+                chatId: chat.id,
+                chatTopic: chat.topic,
+                chatType: chat.chatType,
+                participants: [],
+              })
+            }
+          } else if (
+            t === "#microsoft.graph.callEndedEventMessageDetail" &&
+            ed.callId
+          ) {
+            // Latest participants list wins. For the same call, all callEnded
+            // events carry the same list, but we keep the last-seen defensively.
+            const parts = extractParticipants(ed.callParticipants)
+            if (parts.length > 0) {
+              participantsByCallId.set(ed.callId, parts)
+            }
           }
         }
+
+        if (passedWindowEdge) break
+        msgPath = msgPage["@odata.nextLink"] ?? null
+      }
+
+      // If we exited the loop without passing the window edge and there are
+      // still more pages, we hit the per-chat cap. Flag it -- never silent.
+      if (!passedWindowEdge && msgPath !== null) {
+        chatTruncatedSet.add(chat.id)
       }
     } catch (err) {
       // Bad chat shouldn't kill the whole scan. Log and continue.
       console.warn(`[m365-pull] Failed to scan chat ${chat.id}:`, err)
+    } finally {
+      progressDone++
+      onProgress?.(
+        `Scanning chats for recordings\u2026 (${progressDone}/${recentChats.length}, ${hits.size} found)`,
+      )
     }
+  }
+
+  // Concurrency pool: 4 chat scans in parallel
+  const CONCURRENCY = 4
+  if (recentChats.length > 0) {
+    let chatIdx = 0
+    const workers = Array.from(
+      { length: Math.min(CONCURRENCY, recentChats.length) },
+      async () => {
+        while (chatIdx < recentChats.length) {
+          const i = chatIdx++
+          await scanChat(recentChats[i])
+        }
+      },
+    )
+    await Promise.all(workers)
   }
 
   // Phase 3: join participants into recordings by callId
@@ -291,11 +386,8 @@ export async function listRecordings(
   }
 
   // Phase 4: fallback for recordings without participants. 1:1 ad-hoc calls
-  // (not scheduled meetings) don't emit callEndedEventMessageDetail in their
-  // chat, so the join above produces nothing. Fall back to chat membership:
-  //   - For 1:1 chats this is exact (2 members = the user + 1 other)
-  //   - For group chats it's a superset of call attendance, but honest
-  //   - Members fetched once per unique chatId, attached to all that chat's recordings
+  // don't emit callEndedEventMessageDetail, so the join above produces nothing.
+  // Fall back to chat membership (exact for 1:1; superset for group chats).
   const chatsNeedingFallback = new Set<string>()
   for (const rec of hits.values()) {
     if (rec.participants.length === 0) chatsNeedingFallback.add(rec.chatId)
@@ -342,12 +434,37 @@ export async function listRecordings(
     }
   }
 
-  const recordings = Array.from(hits.values()).sort((a, b) =>
-    b.eventCreatedDateTime.localeCompare(a.eventCreatedDateTime),
-  )
+  // Phase 5: group recordings into containers by chatId
+  const containerMap = new Map<string, RecordingContainer>()
+  for (const rec of hits.values()) {
+    if (!containerMap.has(rec.chatId)) {
+      containerMap.set(rec.chatId, {
+        chatId: rec.chatId,
+        chatTopic: rec.chatTopic,
+        chatType: rec.chatType,
+        recordings: [],
+        truncated: chatTruncatedSet.has(rec.chatId),
+      })
+    }
+    containerMap.get(rec.chatId)!.recordings.push(rec)
+  }
+
+  // Sort recordings within each container newest-first
+  for (const container of containerMap.values()) {
+    container.recordings.sort((a, b) =>
+      b.eventCreatedDateTime.localeCompare(a.eventCreatedDateTime),
+    )
+  }
+
+  // Sort containers by most-recent recording date descending
+  const containers = Array.from(containerMap.values()).sort((a, b) => {
+    const aDate = a.recordings[0]?.eventCreatedDateTime ?? ""
+    const bDate = b.recordings[0]?.eventCreatedDateTime ?? ""
+    return bDate.localeCompare(aDate)
+  })
 
   return {
-    recordings,
+    containers,
     chatsScanned: recentChats.length,
     truncated,
   }

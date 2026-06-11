@@ -22,7 +22,7 @@ export interface RecordingPrefs {
 export type Destination = "browser" | "onedrive"
 
 export interface RecordingRange {
-  kind: "this-week" | "last-7d" | "last-30d" | "custom"
+  kind: "this-week" | "last-7d" | "last-30d" | "since-last-download" | "custom"
   /** yyyy-mm-dd; only meaningful when kind === "custom" */
   customFrom?: string
   /** yyyy-mm-dd; only meaningful when kind === "custom" */
@@ -48,6 +48,8 @@ export interface UserPrefs {
   markedInclude?: boolean
   /** When true, hide recordings that have already been downloaded. */
   hideDownloaded?: boolean
+  /** When true, always include marked recording containers in the list regardless of range. Defaults to true. */
+  recordingMarkedInclude?: boolean
 }
 
 export interface AppState {
