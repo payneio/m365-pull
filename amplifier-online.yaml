@@ -22,8 +22,12 @@ frontend:
   app_location: "/"  # Path to frontend code in repo (e.g., "/frontend" for monorepo)
   output_location: "dist"  # Build output directory (must match vite/webpack/next config)
   build_command: "npm run build"  # Optional - defaults to "npm run build"
-  protected: false  # Set to "login" to require sign-in
-  # auth: true     # Uncomment if your SPA needs MSAL.js token acquisition
+  protected: login  # COMPLIANCE: edge access-gate — anonymous users cannot load the page shell
+  # auth: true     # Intentionally NOT set: MSAL.js token acquisition uses the
+  #                existing "Team Pulse" registration (ccef276a) via build-time
+  #                VITE_MSAL_* vars. protected: login provisions a separate
+  #                ao-m365-pull registration used ONLY as the EasyAuth gate
+  #                identity; Graph delegated tokens still come from ccef276a.
 
 # Note: This stack is STATIC ONLY (no backend, no databases, no SSR)
 # Need backend API? Use web-app-awa (Web App + Static Web App)

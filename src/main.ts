@@ -73,6 +73,47 @@ await msal.initialize()
 const redirectResp = await msal.handleRedirectPromise()
 if (redirectResp?.account) msal.setActiveAccount(redirectResp.account)
 
+// EasyAuth edge-gate bridge.
+//
+// In production the Static Web App enforces an EasyAuth access-gate: anonymous
+// users are redirected to Entra and authenticated BEFORE this bundle ever loads
+// (see staticwebapp.config.json). EasyAuth's session is a server-side SWA cookie
+// — it does NOT populate MSAL's cache — so without this bridge the user would be
+// prompted to sign in a SECOND time by MSAL.js. ssoSilent rides the shared Entra
+// session cookie established by the EasyAuth login to silently establish an MSAL
+// account, collapsing the two logins into a single visible ceremony.
+//
+// Local dev has no EasyAuth (Vite serves no /.auth endpoint); every step below
+// fails soft and falls through to the interactive sign-in button in render().
+if (!msal.getActiveAccount()) {
+  const cached = msal.getAllAccounts()
+  if (cached.length > 0) {
+    // Returning visit — reuse the account MSAL already cached.
+    msal.setActiveAccount(cached[0])
+  } else {
+    try {
+      // Pull the signed-in user's UPN from EasyAuth so ssoSilent can target them.
+      let loginHint: string | undefined
+      try {
+        const me = await fetch("/.auth/me")
+        if (me.ok) {
+          const data = await me.json()
+          loginHint = data?.clientPrincipal?.userDetails || undefined
+        }
+      } catch {
+        // /.auth/me unavailable (local dev) — attempt ssoSilent without a hint.
+      }
+      // Minimal scope just to establish the account/session; per-call tokens for
+      // Chat.Read / Files.* are acquired later via acquireTokenSilent (already
+      // consented on the MSAL registration), so no extra prompt results.
+      const sso = await msal.ssoSilent(loginHint ? { scopes: ["User.Read"], loginHint } : { scopes: ["User.Read"] })
+      if (sso?.account) msal.setActiveAccount(sso.account)
+    } catch {
+      // No silent session bridge available — render() shows the sign-in button.
+    }
+  }
+}
+
 // ----- State -----
 
 type SourceId = "teams.chats" | "teams.recordings"
