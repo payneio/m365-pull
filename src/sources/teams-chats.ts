@@ -7,6 +7,21 @@ export interface TeamsChatMember {
   userId?: string
 }
 
+/** Minimal shape of the Graph chatMessageInfo resource returned by $expand=lastMessagePreview. */
+export interface ChatMessagePreview {
+  id?: string
+  createdDateTime?: string | null
+  /** "message" = a real human message; "systemEventMessage" = membership/system event; others exist. */
+  messageType?: string | null
+  isDeleted?: boolean
+  /** Present on systemEventMessage previews. Its "@odata.type" discriminates the
+   * event kind — e.g. #microsoft.graph.callRecordingEventMessageDetail (a real
+   * meeting/call event) vs #microsoft.graph.membersDeletedEventMessageDetail
+   * (org/roster churn — the phantom-activity inflator). Per the Graph v1.0
+   * chatMessageInfo schema, eventDetail is returned with $expand=lastMessagePreview. */
+  eventDetail?: { "@odata.type"?: string } | null
+}
+
 export interface TeamsChatItem {
   id: string
   topic: string | null
@@ -15,6 +30,8 @@ export interface TeamsChatItem {
   lastUpdatedDateTime: string
   webUrl: string
   members?: TeamsChatMember[]
+  /** Last message preview — present when the list call uses $expand=lastMessagePreview. */
+  lastMessagePreview?: ChatMessagePreview | null
 }
 
 export interface TeamsChatMessage {
@@ -131,7 +148,7 @@ export async function listChatsPage(
     value: TeamsChatItem[]
     "@odata.nextLink"?: string
   }
-  const path = cursor ?? "/me/chats?$top=50&$expand=members"
+  const path = cursor ?? "/me/chats?$top=50&$expand=members,lastMessagePreview"
   const page = await graphGet<ChatsApiPage>(msal, path, ["Chat.Read"])
   return {
     // Slim members to displayName-only at the parse boundary. chatDisplayName()
@@ -146,19 +163,36 @@ export async function listChatsPage(
 }
 
 
-/** Fetch a single chat by ID, expanding slim members (displayName-only).
+/** True iff `id` is a valid Teams chat MRI (`19:…@thread.v2` / `@unq.gbl.spaces`).
  *
- * Returns null on 404 (deleted / no longer accessible) so callers can fail
- * soft without aborting the overall load. All other errors are re-thrown.
+ * Teams chat ids are thread MRIs that ALWAYS start with `19:`. Ids that look
+ * like Outlook/Exchange item ids (base64-ish, starting `AAMk…`) are NOT chat
+ * MRIs — they're calendar/meeting-derived ids (or stale marks from an earlier
+ * build). Calling `/me/chats/{id}` with one of those 400s with
+ * "Invalid MRI, should start with digits and colon". We guard against that
+ * here so the marked-include enrichment never fires a doomed request. */
+export function isTeamsChatMri(id: string): boolean {
+  return id.startsWith("19:")
+}
+
+/** Fetch a single chat by ID, expanding slim members (displayName-only) and
+ * the last message preview (used to derive a real activity date).
+ *
+ * Returns null on 404 (deleted / no longer accessible) OR when `chatId` is not
+ * a valid Teams chat MRI (no network call made) so callers can fail soft
+ * without aborting the overall load. All other errors are re-thrown.
  */
 export async function fetchChatById(
   msal: PublicClientApplication,
   chatId: string,
 ): Promise<TeamsChatItem | null> {
+  // Skip ids that aren't Teams chat MRIs — they'd 400 ("Invalid MRI"). These
+  // are orphaned/stale marks (e.g. AAMk… Outlook ids); treat as un-fetchable.
+  if (!isTeamsChatMri(chatId)) return null
   try {
     const chat = await graphGet<TeamsChatItem>(
       msal,
-      `/me/chats/${encodeURIComponent(chatId)}?$expand=members`,
+      `/me/chats/${encodeURIComponent(chatId)}?$expand=members,lastMessagePreview`,
       ["Chat.Read"],
     )
     return {

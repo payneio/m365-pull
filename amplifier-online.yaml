@@ -1,61 +1,33 @@
-# Amplifier Online - Azure Static Web App Stack Configuration
-# Documentation: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/static-web-app.md
+# Amplifier Online - Azure Container Apps Stack Configuration
+# Docs: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/web-app-aca.md
+#
+# Project m365-pull-app — the ACA-hosted deployment of the m365-pull SPA.
+#
+# WHY ACA (not static-web-app): this app has a HARD single-tenant compliance
+# requirement — anonymous users must be bounced to AAD before the shell loads.
+# That edge gate needs a custom single-tenant EasyAuth config, which on SWA
+# requires the Standard SKU; amplifier-online provisions SWA at Free with no
+# SKU knob, so the gate is undeployable there. ACA's web-container EasyAuth
+# sidecar (protected: login -> RedirectToLoginPage, issuer pinned to the
+# tenant) delivers the single-tenant gate at provision time.
+#
+# COEXISTS WITH THE OLD SWA: this is a NEW project (m365-pull-app) with NEW
+# resources and a NEW ao-m365-pull-app registration. The old static-web-app
+# project (m365-pull / victorious-cliff SWA / ao-m365-pull) is left fully
+# intact for the dev team and is unaffected by this manifest.
 
-name: m365-pull
-stack: static-web-app
+name: m365-pull-app
+stack: web-app-aca
 
-# Static frontend (built and deployed by GitHub Actions)
-#
-# Auth options:
-#   protected: login | false
-#     - login: Require sign-in for all routes (configure via staticwebapp.config.json)
-#     - false: No authentication required (default)
-#   auth: true | false
-#     - true:  Register AAD app and inject AZURE_CLIENT_ID for MSAL.js token acquisition
-#     - false: No AAD identity needed (default)
-#   Note: protected != false creates the app registration automatically, but
-#     auth: true is still needed if the SPA acquires its own tokens via MSAL.js.
-frontend:
-  type: static-web-app
-  repo: "https://github.com/bkrabach/m365-pull"  # REQUIRED: GitHub repo URL
-  branch: main
-  app_location: "/"  # Path to frontend code in repo (e.g., "/frontend" for monorepo)
-  output_location: "dist"  # Build output directory (must match vite/webpack/next config)
-  build_command: "npm run build"  # Optional - defaults to "npm run build"
-  protected: login  # COMPLIANCE: edge access-gate — anonymous users cannot load the page shell
-  # auth: true     # Intentionally NOT set: MSAL.js token acquisition uses the
-  #                existing "Team Pulse" registration (ccef276a) via build-time
-  #                VITE_MSAL_* vars. protected: login provisions a separate
-  #                ao-m365-pull registration used ONLY as the EasyAuth gate
-  #                identity; Graph delegated tokens still come from ccef276a.
+services:
+  # Single static-frontend container: nginx serving the built Vite SPA.
+  # No api service — the SPA calls Microsoft Graph directly via MSAL.js
+  # (existing "Team Pulse" registration ccef276a), so there is no backend.
+  web:
+    image: amplifieronlinecr.azurecr.io/m365-pull-app-web:latest
+    port: 80  # nginx listen port (see Dockerfile / nginx.conf)
+    protected:
+      mode: login  # EasyAuth sidecar -> RedirectToLoginPage: the compliance gate
+    auth: true  # registers the SPA redirect URI so MSAL.js can acquire tokens
 
-# Note: This stack is STATIC ONLY (no backend, no databases, no SSR)
-# Need backend API? Use web-app-awa (Web App + Static Web App)
-# Need SSR or containers? Use web-app-aca (Container Apps)
-
-# BEFORE YOU DEPLOY:
-# 1. Commit your frontend code to a GitHub repository
-# 2. Test build locally: npm run build
-# 3. Verify output_location matches your build config (dist/, build/, out/)
-# 4. Update frontend.repo above with your GitHub repository URL
-# 5. Run: amplifier-online up
-#
-# AFTER DEPLOYMENT:
-# - Get deployment token: Azure Portal → Static Web App → Manage deployment token → Copy
-# - Add AZURE_STATIC_WEB_APPS_API_TOKEN to GitHub repository secrets:
-#   Settings → Secrets and variables → Actions → New repository secret
-# - Generate CI/CD: amplifier-online cicd create
-# - Push to GitHub: automatic deployment starts!
-#
-# AUTOMATIC FEATURES:
-# ✅ PR preview deployments (each PR gets its own URL)
-# ✅ Free custom domain SSL certificates
-# ✅ Built-in authentication (EasyAuth)
-# ✅ GitHub-integrated CI/CD
-#
-# COMMON ISSUES:
-# - SPA routing 404s on refresh? Add staticwebapp.config.json with navigationFallback
-# - Build fails? Check GitHub Actions logs and match Node version locally
-# - Wrong files deployed? Verify output_location matches your build output directory
-#
-# Need help? See: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/static-web-app.md
+# No api service, no managed databases — this is a pure static SPA.

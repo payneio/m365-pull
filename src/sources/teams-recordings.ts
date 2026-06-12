@@ -77,6 +77,21 @@ export interface RecordingInfo {
   webUrl: string
 }
 
+/** Thrown when a recording lives in another org's SharePoint (cross-tenant
+ * meeting). Graph's /shares/{id}/driveItem returns 400 "Invalid hostname for
+ * this tenancy" because this account can't resolve a foreign tenant's host.
+ * The transcript simply isn't accessible via this account — it's not a real
+ * failure, so callers should label and count it separately. */
+export class CrossTenantRecordingError extends Error {
+  readonly crossTenant = true as const
+  constructor(
+    message = "Recording stored in another tenant — transcript not accessible via this account",
+  ) {
+    super(message)
+    this.name = "CrossTenantRecordingError"
+  }
+}
+
 
 /** Resolve a SharePoint sharing URL (or stream.aspx URL) to the underlying
  * drive/item via Microsoft Graph. Requires Files.Read.All. */
@@ -93,6 +108,12 @@ export async function resolveRecordingFromUrl(
   })
   if (!resp.ok) {
     const body = await resp.text()
+    // Cross-tenant recording: the .mp4 lives in another org's SharePoint, which
+    // this account can't resolve. Graph returns 400 "Invalid hostname for this
+    // tenancy" / invalidRequest. Surface as a typed, non-failure outcome.
+    if (resp.status === 400 && /hostname|invalidRequest/i.test(body)) {
+      throw new CrossTenantRecordingError()
+    }
     throw new Error(
       `Resolve share: ${resp.status} ${resp.statusText} — ${body.slice(0, 300)}`,
     )

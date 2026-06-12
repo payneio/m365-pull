@@ -14,6 +14,7 @@ export interface UIState {
     enabledTypes: string[]
     sortKey: SortKey
     markedOnly: boolean
+    showIgnored: boolean
   }
   recordingFilter?: {
     search: string

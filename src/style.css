@@ -617,3 +617,40 @@ header {
 .chat-row.marked {
   background: linear-gradient(to right, rgba(245, 158, 11, 0.06), transparent 80%);
 }
+
+/* Ignore toggle on each chat row — mirrors .mark-toggle */
+.ignore-toggle {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+  color: #c0c0c0;
+  transition: color 100ms, transform 100ms;
+}
+
+.ignore-toggle:hover {
+  color: #6b7280;
+  transform: scale(1.1);
+  background: transparent;
+}
+
+.ignore-toggle.ignored {
+  color: #9ca3af;
+}
+
+.chat-row.ignored {
+  background: linear-gradient(to right, rgba(107, 114, 128, 0.06), transparent 80%);
+  opacity: 0.75;
+}
+
+/* "Show ignored" chip in the filter bar */
+.chip.show-ignored.active {
+  background: #6b7280;
+  border-color: #6b7280;
+  color: white;
+}

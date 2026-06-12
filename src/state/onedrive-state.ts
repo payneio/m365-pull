@@ -59,6 +59,10 @@ export interface AppState {
   /** Item IDs the user has marked. Holds chat IDs and recording IDs
    * (composite callId::filename) -- distinct keyspaces, same Set. */
   marks: string[]
+  /** Chat IDs the user has ignored. Hidden from the default list view;
+   * revealed only via the "Show ignored" filter toggle. Merged additively
+   * like marks so ignores from one device are never silently dropped. */
+  ignored?: string[]
   chatPrefs?: Record<string, ChatPrefs>
   recordingPrefs?: Record<string, RecordingPrefs>
   /** User-level preferences; sync across devices via this state blob. */
@@ -129,7 +133,7 @@ export async function saveOneDriveState(
   }
 }
 
-/** Merge two states. Marks are unioned; chatPrefs prefer the newer entry. */
+/** Merge two states. Marks and ignored are unioned; chatPrefs prefer the newer entry. */
 export function mergeStates(
   local: AppState,
   remote: AppState | null,
@@ -137,6 +141,8 @@ export function mergeStates(
   if (!remote) return local
   // Marks: union — they're additive by nature
   const marks = new Set<string>([...local.marks, ...remote.marks])
+  // Ignored: union — additive like marks (un-ignore is done explicitly, never lost)
+  const ignored = new Set<string>([...(local.ignored ?? []), ...(remote.ignored ?? [])])
   // chatPrefs: prefer whichever side has a more recent updatedAt
   const localTime = Date.parse(local.updatedAt) || 0
   const remoteTime = Date.parse(remote.updatedAt) || 0
@@ -158,6 +164,7 @@ export function mergeStates(
     updatedAt: new Date().toISOString(),
     updatedBy: local.updatedBy || remote.updatedBy,
     marks: [...marks].sort(),
+    ignored: ignored.size > 0 ? [...ignored].sort() : undefined,
     chatPrefs: Object.keys(chatPrefs).length > 0 ? chatPrefs : undefined,
     recordingPrefs:
       Object.keys(recordingPrefs).length > 0 ? recordingPrefs : undefined,

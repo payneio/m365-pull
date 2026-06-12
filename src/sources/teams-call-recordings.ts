@@ -159,6 +159,22 @@ async function getGraphToken(
   return r.accessToken
 }
 
+// Session-scoped flag: once a member fetch proves ChatMember.Read is not
+// consented (AADSTS65001 / invalid_grant / InteractionRequiredAuthError),
+// stop attempting member fetches for the rest of the session. This kills the
+// per-chat token 400 + error console spam. Recordings still list fine via
+// Chat.Read — just without participant names. Resets on page reload, so if the
+// scope is later consented, names resolve automatically on the next load.
+let memberFetchDisabled = false
+
+/** True when an error is a consent/permission failure for a missing scope —
+ * the signal to degrade quietly rather than retry per chat. */
+function isConsentError(err: unknown): boolean {
+  const e = err as { name?: string; errorCode?: string; message?: string }
+  const hay = `${e?.name ?? ""} ${e?.errorCode ?? ""} ${e?.message ?? ""} ${String(err)}`
+  return /AADSTS65001|invalid_grant|InteractionRequiredAuthError/i.test(hay)
+}
+
 /** Graph GET with retry: honors Retry-After on 429, exponential backoff on
  * 502/503/504. Up to 5 retries before throwing. Refreshes token each attempt
  * so stale tokens don't block long-running paginated scans. */
@@ -392,10 +408,14 @@ export async function listRecordings(
   for (const rec of hits.values()) {
     if (rec.participants.length === 0) chatsNeedingFallback.add(rec.chatId)
   }
-  if (chatsNeedingFallback.size > 0) {
+  // Skip the whole member-fetch phase if a prior scan this session already
+  // proved ChatMember.Read isn't consented — no point re-attempting tokens.
+  if (chatsNeedingFallback.size > 0 && !memberFetchDisabled) {
     onProgress?.(`Filling participants for ${chatsNeedingFallback.size} chats...`)
     const membersByChat = new Map<string, Participant[]>()
     for (const chatId of chatsNeedingFallback) {
+      // Consent already known-missing mid-loop — stop trying for this scan too.
+      if (memberFetchDisabled) break
       try {
         type MemberResponse = {
           value: {
@@ -420,6 +440,17 @@ export async function listRecordings(
         }
         membersByChat.set(chatId, members)
       } catch (err) {
+        // Consent/permission error → degrade quietly: log ONCE, set the
+        // session flag, and stop attempting member fetches. No auth redirect —
+        // ChatMember.Read may not be grantable, and recordings list fine
+        // without names. (The chats surface keeps its own redirect path.)
+        if (isConsentError(err)) {
+          memberFetchDisabled = true
+          console.warn(
+            "[m365-pull] Participant names unavailable — ChatMember.Read not consented; listing recordings without names.",
+          )
+          break
+        }
         console.warn(
           `[m365-pull] Failed to fetch members for chat ${chatId}:`,
           err,

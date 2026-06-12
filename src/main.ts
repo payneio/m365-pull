@@ -23,7 +23,7 @@ import {
 import { vttToMarkdown } from "./format/transcript-markdown"
 import { renderChatMarkdown } from "./format/chat-markdown"
 import { saveAsText } from "./destinations/browser"
-import { saveTextToOneDrive } from "./destinations/onedrive"
+import { saveTextToOneDrive, getOneDriveFolderWebUrl } from "./destinations/onedrive"
 import {
   loadUserPrefs,
   saveUserPrefs,
@@ -39,6 +39,7 @@ import {
   formatAge,
 } from "./cache/chats-cache"
 import { loadMarks, saveMarks } from "./cache/marks"
+import { loadIgnored, saveIgnored } from "./cache/ignored"
 import { loadChatPrefs, saveChatPrefs } from "./cache/chat-prefs"
 import { loadRecordingPrefs, saveRecordingPrefs } from "./cache/recording-prefs"
 import { loadUIState, saveUIState } from "./cache/ui-state"
@@ -135,6 +136,7 @@ interface FilterState {
   enabledTypes: Set<string>
   sortKey: SortKey
   markedOnly: boolean
+  showIgnored: boolean
 }
 
 interface RecordingFilterState {
@@ -174,6 +176,7 @@ let filterState: FilterState = {
   enabledTypes: new Set(KNOWN_TYPES.map((t) => t.id)),
   sortKey: "marked-first",
   markedOnly: false,
+  showIgnored: false,
 }
 let recordingFilterState: RecordingFilterState = {
   search: "",
@@ -182,6 +185,7 @@ let recordingFilterState: RecordingFilterState = {
   enabledKinds: new Set(CHAT_TYPE_KINDS.map((k) => k.id)),
 }
 let markedIds: Set<string> = new Set()
+let ignoredIds: Set<string> = new Set()
 let chatPrefs: Record<string, ChatPrefs> = {}
 let recordingPrefs: Record<string, RecordingPrefs> = {}
 let userPrefs: UserPrefs = {
@@ -218,6 +222,57 @@ function formatDateShort(d: Date): string {
     month: "short",
     day: "numeric",
   })
+}
+
+/** True iff a preview is a system event that represents REAL meeting/call
+ * activity (callRecording / callEnded / callStarted / callTranscript), as
+ * opposed to roster/membership churn (members*, *Renamed, *Pinned, etc.).
+ *
+ * Graph stamps the same `lastMessagePreview` slot for both kinds of system
+ * event, but only the call/meeting ones reflect real activity. The eventDetail
+ * `@odata.type` (e.g. `#microsoft.graph.callRecordingEventMessageDetail`)
+ * carries the discriminator — we match the substring "call" case-insensitively.
+ *
+ * Defensive: returns false when `eventDetail`/`@odata.type` is absent, so a
+ * chat with no usable discriminator degrades to the createdDateTime sentinel
+ * (current behaviour — never crashes, never falsely counts roster churn). */
+function isCallActivityEvent(preview: TeamsChatItem["lastMessagePreview"]): boolean {
+  const odataType = preview?.eventDetail?.["@odata.type"]
+  return typeof odataType === "string" && odataType.toLowerCase().includes("call")
+}
+
+/** Derive the "last real conversation activity" timestamp (ms) for a chat.
+ *
+ * Graph bumps `lastUpdatedDateTime` on ANY chat entity change — membership
+ * roster updates, org departures (`membersDeletedEventMessageDetail`),
+ * renames — not just real messages. A chat dead for years can surface as
+ * "active today" due to a roster system event. 33 of 40 sampled recent chats
+ * were phantoms with this pattern (probe result 2026-06-11).
+ *
+ * BUT not all system events are noise: an active MEETING chat's newest item is
+ * often a `callRecordingEventMessageDetail` (a systemEventMessage from the most
+ * recent meeting) — that IS real activity. Treating all system events as noise
+ * wrongly dated active meeting chats to their CREATION date (e.g. "Amplifier
+ * team chat" showed 1/26/2026 despite meeting yesterday).
+ *
+ * Rule: use `lastMessagePreview.createdDateTime` when the preview is EITHER a
+ * real human message (`messageType === "message"`) OR a call/meeting system
+ * event (see isCallActivityEvent). Otherwise — roster/membership churn or no
+ * usable preview — fall back to `createdDateTime` as a distant sentinel so the
+ * chat sorts below genuinely-active chats and falls outside recent windows.
+ *
+ * Defensive: if `lastMessagePreview` is absent (older cache, unexpected API
+ * response) the behaviour degrades to the sentinel — never crashes.
+ */
+function chatActivityDate(chat: TeamsChatItem): number {
+  const preview = chat.lastMessagePreview
+  const isRealMessage = preview?.messageType === "message"
+  if ((isRealMessage || isCallActivityEvent(preview)) && preview?.createdDateTime) {
+    return new Date(preview.createdDateTime).getTime()
+  }
+  // Roster churn / no usable preview: fall back to createdDateTime as the
+  // oldest reasonable timestamp for this chat so it doesn't pollute recent windows.
+  return new Date(chat.createdDateTime).getTime()
 }
 
 // ----- Recording range helpers -----
@@ -386,6 +441,10 @@ function syncUserPrefsToUI(): void {
     | null
   if (folderEl) folderEl.hidden = userPrefs.destination !== "onedrive"
   if (editBtn) editBtn.textContent = userPrefs.oneDriveFolder
+  // Populate the "↗ Open" link to the destination folder in OneDrive on the web.
+  // Fire-and-forget: it resolves the folder's Graph driveItem webUrl and shows
+  // the link only when the folder exists. Hidden until then.
+  void refreshOneDriveFolderLink()
 
   // Recording range
   const range: RecordingRange = userPrefs.recordingRange ?? { kind: "last-7d" }
@@ -428,6 +487,28 @@ function syncUserPrefsToUI(): void {
   if (hideBtn) hideBtn.classList.toggle("active", !!userPrefs.hideDownloaded)
 }
 
+/** Populate the "↗ Open" link next to the OneDrive folder path. Resolves the
+ * destination folder's Graph driveItem webUrl and shows the link only when the
+ * folder exists (it's auto-created on first download). Hidden otherwise — when
+ * destination isn't OneDrive, the folder hasn't been created yet, or the URL is
+ * unavailable. Shared across the chats and recordings surfaces (single top-bar
+ * folder display). Passive: never triggers a consent redirect. */
+async function refreshOneDriveFolderLink(): Promise<void> {
+  const link = document.getElementById("open-folder") as HTMLAnchorElement | null
+  if (!link) return
+  if (userPrefs.destination !== "onedrive") {
+    link.hidden = true
+    return
+  }
+  const webUrl = await getOneDriveFolderWebUrl(msal, userPrefs.oneDriveFolder)
+  if (webUrl) {
+    link.href = webUrl
+    link.hidden = false
+  } else {
+    link.hidden = true
+  }
+}
+
 function typeLabel(type: string): string {
   return KNOWN_TYPES.find((t) => t.id === type)?.label ?? type
 }
@@ -438,6 +519,7 @@ function buildLocalState(): AppState {
     updatedAt: new Date().toISOString(),
     updatedBy: deviceIdentifier(),
     marks: [...markedIds].sort(),
+    ignored: ignoredIds.size > 0 ? [...ignoredIds].sort() : undefined,
     chatPrefs: Object.keys(chatPrefs).length > 0 ? chatPrefs : undefined,
     recordingPrefs:
       Object.keys(recordingPrefs).length > 0 ? recordingPrefs : undefined,
@@ -541,6 +623,12 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       [...mergedMarks].some((id) => !markedIds.has(id))
     markedIds = mergedMarks
     saveMarks(userCacheKey(), markedIds)
+    const mergedIgnored = new Set(merged.ignored ?? [])
+    const ignoredChanged =
+      mergedIgnored.size !== ignoredIds.size ||
+      [...mergedIgnored].some((id) => !ignoredIds.has(id))
+    ignoredIds = mergedIgnored
+    saveIgnored(userCacheKey(), ignoredIds)
     const mergedPrefs = merged.chatPrefs ?? {}
     const prefsChanged =
       JSON.stringify(mergedPrefs) !== JSON.stringify(chatPrefs)
@@ -560,7 +648,7 @@ async function pullAndMergeOneDriveState(): Promise<void> {
       if (userPrefsChanged) syncUserPrefsToUI()
     }
     const changed =
-      marksChanged || prefsChanged || recordingPrefsChanged || userPrefsChanged
+      marksChanged || ignoredChanged || prefsChanged || recordingPrefsChanged || userPrefsChanged
     if (changed) {
       await saveOneDriveState(msal, {
         ...merged,
@@ -589,6 +677,14 @@ async function pullAndMergeOneDriveState(): Promise<void> {
 function applyFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
   const q = filterState.search.trim().toLowerCase()
   let result = chats.filter((c) => {
+    const isIgnored = ignoredIds.has(c.id)
+    if (filterState.showIgnored) {
+      // "Show ignored" mode: show ONLY ignored chats
+      if (!isIgnored) return false
+    } else {
+      // Normal mode: hide ignored chats
+      if (isIgnored) return false
+    }
     if (!filterState.enabledTypes.has(c.chatType)) return false
     if (filterState.markedOnly && !markedIds.has(c.id)) return false
     if (q) {
@@ -598,7 +694,7 @@ function applyFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     return true
   })
   const byRecent = (a: TeamsChatItem, b: TeamsChatItem) =>
-    a.lastUpdatedDateTime < b.lastUpdatedDateTime ? 1 : -1
+    chatActivityDate(b) - chatActivityDate(a)
   const byName = (a: TeamsChatItem, b: TeamsChatItem) =>
     chatDisplayName(a).localeCompare(chatDisplayName(b))
   if (filterState.sortKey === "name") {
@@ -682,6 +778,7 @@ function render(): void {
   }
 
   markedIds = loadMarks(userCacheKey())
+  ignoredIds = loadIgnored(userCacheKey())
   // Migrate: drop old per-recording marks that used the callId::filename composite key.
   // They don't map to containers; re-mark at container level with the rec: prefix.
   let migratedMarks = false
@@ -761,6 +858,7 @@ function render(): void {
         </select>
         <span class="onedrive-folder" id="onedrive-folder" hidden>
           <button class="link-button" id="edit-folder" title="Click to change">/m365-pull/teams-chats</button>
+          <a class="link-button" id="open-folder" target="_blank" rel="noopener" hidden title="Open this folder in OneDrive on the web">↗ Open</a>
         </span>
       </div>
       <div class="actions" id="actions-chats">
@@ -828,6 +926,8 @@ function render(): void {
           </select>
         </label>
         <button class="chip marked-only" id="markedonly">★ Marked only</button>
+        <button class="chip show-ignored" id="showignored">⊘ Show ignored</button>
+        <button class="chip clear-ignored" id="clearignored" hidden>⊘ Clear all ignored</button>
       </div>
       <div class="filters" id="filters-recordings" hidden>
         <input id="search-recordings" type="search" placeholder="Search recordings by topic or filename…" />
@@ -1128,6 +1228,27 @@ function wireGlobalHandlers(account: AccountInfo): void {
     saveUIPrefs()
   })
 
+  // Show ignored toggle — mirrors "Marked only"; turns the list into an
+  // ignored-chats view where each row has an un-ignore affordance.
+  el<HTMLButtonElement>("showignored").addEventListener("click", () => {
+    filterState.showIgnored = !filterState.showIgnored
+    el<HTMLButtonElement>("showignored").classList.toggle(
+      "active",
+      filterState.showIgnored,
+    )
+    rerenderChatList()
+    saveUIPrefs()
+  })
+
+  // Clear all ignored — removes every ignored id via the SAME removal path as
+  // single un-ignore (delete from set → saveIgnored → rerender → schedule a
+  // OneDrive overwrite). The overwrite (last-writer-wins, see saveOneDriveState)
+  // is what makes removal stick; a raw localStorage wipe would be re-unioned
+  // back on the next pull (mergeStates unions ignored sets).
+  el<HTMLButtonElement>("clearignored").addEventListener("click", () => {
+    clearAllIgnored()
+  })
+
   // Destination preference
   syncUserPrefsToUI()
   const destinationSel = el<HTMLSelectElement>("destination")
@@ -1203,6 +1324,7 @@ function saveUIPrefs(): void {
       enabledTypes: [...filterState.enabledTypes],
       sortKey: filterState.sortKey,
       markedOnly: filterState.markedOnly,
+      showIgnored: filterState.showIgnored,
     },
     recordingFilter: {
       search: recordingFilterState.search,
@@ -1228,6 +1350,7 @@ function hydrateUIStateFromStorage(): void {
       ),
       sortKey: saved.chatFilter.sortKey ?? "marked-first",
       markedOnly: saved.chatFilter.markedOnly ?? false,
+      showIgnored: saved.chatFilter.showIgnored ?? false,
     }
   }
   if (saved.recordingFilter) {
@@ -1264,6 +1387,8 @@ function syncUIControlsFromState(): void {
   if (sortbyEl) sortbyEl.value = filterState.sortKey
   const markedOnlyChat = document.getElementById("markedonly")
   if (markedOnlyChat) markedOnlyChat.classList.toggle("active", filterState.markedOnly)
+  const showIgnoredBtn = document.getElementById("showignored")
+  if (showIgnoredBtn) showIgnoredBtn.classList.toggle("active", filterState.showIgnored)
   document
     .querySelectorAll<HTMLButtonElement>("#type-chips .chip[data-type]")
     .forEach((chip) => {
@@ -1331,6 +1456,11 @@ function rerenderChatList(): void {
         toggleMark(btn.dataset.chatId!)
       })
     })
+    list.querySelectorAll<HTMLButtonElement>(".ignore-toggle").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        toggleIgnore(btn.dataset.chatId!)
+      })
+    })
   }
   updateTypeCountChips()
   updateFiltersVisibility()
@@ -1341,29 +1471,36 @@ function rerenderChatList(): void {
 function updateMatchSummary(visible: number): void {
   const total = chatsState.chats.length
   const marked = markedIds.size
+  const ignored = ignoredIds.size
+  const ignoredNote = ignored > 0 ? ` · ${ignored} ignored` : ""
+  // "Clear all ignored" is only relevant when something is ignored.
+  const clearBtn = document.getElementById("clearignored") as HTMLButtonElement | null
+  if (clearBtn) clearBtn.hidden = ignored === 0
   const filtered = visible < total
   if (filtered) {
-    setStatus(`Showing ${visible} of ${total} loaded · ${marked} marked`)
+    setStatus(`Showing ${visible} of ${total} loaded · ${marked} marked${ignoredNote}`)
   } else {
-    setStatus(`${total} chats loaded · ${marked} marked`)
+    setStatus(`${total} chats loaded · ${marked} marked${ignoredNote}`)
   }
 }
 
 function renderChatRow(chat: TeamsChatItem): string {
   const name = chatDisplayName(chat)
   const isMarked = markedIds.has(chat.id)
+  const isIgnored = ignoredIds.has(chat.id)
   const lastSync = chatPrefs[chat.id]?.lastSync
   const downloadedTag = lastSync
     ? ` · downloaded ${formatDateShort(new Date(lastSync))}`
     : ""
-  const sub = `${typeLabel(chat.chatType)} · last activity ${formatDate(chat.lastUpdatedDateTime)}${downloadedTag}`
+  const sub = `${typeLabel(chat.chatType)} · last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}${downloadedTag}`
   return `
-    <li class="chat-row${isMarked ? " marked" : ""}">
-      <button class="mark-toggle${isMarked ? " marked" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Unmark" : "Mark"} this chat" aria-label="${isMarked ? "Unmark" : "Mark"}">${isMarked ? "★" : "☆"}</button>
+    <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}">
+      <button class="mark-toggle${isMarked ? " marked" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Unmark" : "Mark"} this chat" aria-label="${isMarked ? "Unmark" : "Mark"}">${isMarked ? "\u2605" : "\u2606"}</button>
       <div class="chat-info">
         <div class="chat-name">${escapeHtml(name)}</div>
         <div class="chat-sub">${escapeHtml(sub)}</div>
       </div>
+      <button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore" : "Ignore"} this chat" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}">${isIgnored ? "\u2299" : "\u2298"}</button>
       <button class="chat-action" data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}">Download</button>
     </li>
   `
@@ -1381,6 +1518,83 @@ function toggleMark(id: string): void {
   rerenderRecordingsList()
   updateBulkButtons()
   scheduleOneDriveSave()
+}
+
+// Timer for the transient undo affordance shown after ignoring a chat.
+let undoIgnoreTimer: number | null = null
+let undoIgnoreId: string | null = null
+
+/** Toggle the ignored state for a chat. Hiding is immediate; un-ignore is
+ * available via the "Show ignored" view or via the transient undo affordance. */
+function toggleIgnore(id: string): void {
+  const wasIgnored = ignoredIds.has(id)
+  if (wasIgnored) {
+    ignoredIds.delete(id)
+  } else {
+    ignoredIds.add(id)
+  }
+  saveIgnored(userCacheKey(), ignoredIds)
+  rerenderChatList()
+  scheduleOneDriveSave()
+
+  // Undo affordance: show a transient "Chat ignored. Undo" message in the
+  // status bar for 5 seconds. Any subsequent setStatus() call clears it
+  // (textContent overwrites innerHTML), so the undo disappears naturally
+  // when the user performs another action.
+  if (!wasIgnored) {
+    if (undoIgnoreTimer !== null) window.clearTimeout(undoIgnoreTimer)
+    undoIgnoreId = id
+    const chatItem = chatsState.chats.find((c) => c.id === id)
+    const label = chatItem ? `"${escapeHtml(chatDisplayName(chatItem))}"` : "Chat"
+    const statusEl = document.getElementById("status")
+    if (statusEl) {
+      statusEl.innerHTML = `${label} ignored. <button class="link-button" id="undo-ignore">Undo</button>`
+      const undoBtn = document.getElementById("undo-ignore")
+      if (undoBtn) {
+        undoBtn.addEventListener("click", () => {
+          if (undoIgnoreId) {
+            ignoredIds.delete(undoIgnoreId)
+            undoIgnoreId = null
+            if (undoIgnoreTimer !== null) {
+              window.clearTimeout(undoIgnoreTimer)
+              undoIgnoreTimer = null
+            }
+            saveIgnored(userCacheKey(), ignoredIds)
+            rerenderChatList()
+            scheduleOneDriveSave()
+            setStatus("")
+          }
+        })
+      }
+    }
+    undoIgnoreTimer = window.setTimeout(() => {
+      undoIgnoreTimer = null
+      undoIgnoreId = null
+      setStatus("")
+    }, 5000)
+  }
+}
+
+/** Remove ALL ignored ids at once, via the SAME removal primitives that single
+ * un-ignore uses: clear the in-memory set → saveIgnored (localStorage) →
+ * rerender → scheduleOneDriveSave. The OneDrive save overwrites state.json
+ * (last-writer-wins) with `ignored: undefined`, so the cleared set propagates
+ * cross-device. A raw localStorage wipe would NOT work — mergeStates unions
+ * ignored sets on the next pull and would resurrect them. */
+function clearAllIgnored(): void {
+  if (ignoredIds.size === 0) return
+  const count = ignoredIds.size
+  // Cancel any pending single-undo so it can't re-add a now-cleared id.
+  if (undoIgnoreTimer !== null) {
+    window.clearTimeout(undoIgnoreTimer)
+    undoIgnoreTimer = null
+  }
+  undoIgnoreId = null
+  ignoredIds = new Set()
+  saveIgnored(userCacheKey(), ignoredIds)
+  rerenderChatList()
+  scheduleOneDriveSave()
+  setStatus(`Cleared ${count} ignored chat${count === 1 ? "" : "s"}.`)
 }
 
 function updateTypeCountChips(): void {
@@ -1438,10 +1652,14 @@ async function initialLoadChats(): Promise<void> {
   // PROVEN METHOD — validated against a working reference implementation and a
   // live probe (80 chats for a 7-day window in ~5 pages, ZERO per-chat calls):
   //
-  // (a) No per-chat enrichment: lastUpdatedDateTime from /me/chats is trusted
-  //     directly. The probe confirmed it returns the correct recent set.
-  //     Accepted gap: rare deeply-stale 1:1s (months-silent, one recent msg)
-  //     may sit below the stop point and won't appear — explicit, accepted cost.
+  // (a) No per-chat enrichment: we derive chatActivityDate() from
+  //     lastMessagePreview.createdDateTime when messageType === "message".
+  //     lastUpdatedDateTime is intentionally NOT used for filtering/sorting
+  //     because Graph bumps it on system events (membersDeleted, callEnded,
+  //     etc.) — 33 of 40 sampled "recent" chats were phantoms from org
+  //     departures stamped today (probe 2026-06-11). Accepted gap: rare
+  //     deeply-stale 1:1s (months-silent, one recent msg) may sit below the
+  //     stop point and won't appear — explicit, accepted cost.
   //
   // (b) Jitter-tolerant stop: Graph's chat ordering is non-monotonic and
   //     unstable between requests (87 ordering violations measured in the probe).
@@ -1464,7 +1682,7 @@ async function initialLoadChats(): Promise<void> {
       pageCount++
 
       const inWindow = page.chats.filter((c) => {
-        const t = new Date(c.lastUpdatedDateTime).getTime()
+        const t = chatActivityDate(c)
         return t >= cutoffMs && t <= untilMs
       })
 
@@ -1472,7 +1690,7 @@ async function initialLoadChats(): Promise<void> {
       // bound (cutoffMs). Items that are too recent (> untilMs, custom range)
       // don't mean we've passed the window — we just haven't gotten there yet.
       const allBelowCutoff = page.chats.every(
-        (c) => new Date(c.lastUpdatedDateTime).getTime() < cutoffMs,
+        (c) => chatActivityDate(c) < cutoffMs,
       )
 
       if (inWindow.length > 0) {
@@ -1518,11 +1736,7 @@ async function initialLoadChats(): Promise<void> {
       }
     }
 
-    kept.sort(
-      (a, b) =>
-        new Date(b.lastUpdatedDateTime).getTime() -
-        new Date(a.lastUpdatedDateTime).getTime(),
-    )
+    kept.sort((a, b) => chatActivityDate(b) - chatActivityDate(a))
 
     chatsState = { chats: kept }
     rerenderChatList()
@@ -1883,6 +2097,8 @@ async function downloadChat(
       rerenderChatList()
       const incrementalNote = usingIncremental ? " (incremental)" : ""
       if (destination === "onedrive") {
+        // Folder now exists (or still does) — refresh the "↗ Open" link.
+        void refreshOneDriveFolderLink()
         const where = result.path ? `OneDrive (${result.path})` : "OneDrive"
         setStatus(
           `✓ Saved ${messages.length} messages from "${chatName}" to ${where}${incrementalNote}.`,
@@ -1917,10 +2133,15 @@ async function downloadChat(
 
 // ----- Downloading recording transcripts -----
 
+/** Outcome of a single transcript download. "cross-tenant" is NOT a failure —
+ * the recording lives in another org's SharePoint and isn't accessible via this
+ * account; callers count it separately from real failures. */
+type TranscriptOutcome = "ok" | "fail" | "cross-tenant"
+
 async function downloadRecordingTranscript(
   recordingId: string,
   button: HTMLButtonElement,
-): Promise<boolean> {
+): Promise<TranscriptOutcome> {
   // Search all containers for the recording
   let recording: RecordingItem | undefined
   for (const container of recordingsState.containers) {
@@ -1929,7 +2150,7 @@ async function downloadRecordingTranscript(
   }
   if (!recording) {
     setStatus("Recording not found in current list. Refresh and try again.", "error")
-    return false
+    return "fail"
   }
   const originalLabel = button.textContent
   button.disabled = true
@@ -1952,7 +2173,7 @@ async function downloadRecordingTranscript(
       setStatus(
         `No transcripts attached to "${subject}". (Transcription may not have been enabled.)`,
       )
-      return false
+      return "fail"
     }
     button.textContent = "Saving…"
     const account = msal.getActiveAccount()
@@ -2030,18 +2251,27 @@ async function downloadRecordingTranscript(
       } else {
         setStatus(`✓ Saved ${payload.transcriptCount} transcript(s) for "${subject}".`)
       }
-      return true
+      return "ok"
     } else if (result.reason === "cancelled") {
       setStatus(`Save cancelled. (${payload.transcriptCount} transcripts fetched but not written.)`)
-      return false
+      return "fail"
     } else {
       setStatus(`Save failed: ${result.reason}`, "error")
-      return false
+      return "fail"
     }
   } catch (err) {
+    // Cross-tenant recording: not a real failure — the .mp4 lives in another
+    // org's SharePoint and isn't reachable via this account. Label distinctly
+    // and let callers count it separately from genuine failures.
+    if ((err as { crossTenant?: boolean }).crossTenant) {
+      setStatus(
+        `⊗ "${subject}" — cross-tenant: transcript stored in another org, not available.`,
+      )
+      return "cross-tenant"
+    }
     setStatus(`Error: ${(err as Error).message}`, "error")
     console.error("[m365-pull] downloadRecordingTranscript failed:", err)
-    return false
+    return "fail"
   } finally {
     button.disabled = false
     button.textContent = originalLabel || "Download transcript"
@@ -2096,18 +2326,20 @@ async function downloadContainerTranscripts(
   button.disabled = true
   let ok = 0
   let fail = 0
+  let crossTenant = 0
   for (let i = 0; i < container.recordings.length; i++) {
     const rec = container.recordings[i]
     button.textContent = `Syncing ${i + 1}/${container.recordings.length}\u2026`
     const tempBtn = document.createElement("button")
-    const success = await downloadRecordingTranscript(rec.id, tempBtn)
-    if (success) ok++
+    const outcome = await downloadRecordingTranscript(rec.id, tempBtn)
+    if (outcome === "ok") ok++
+    else if (outcome === "cross-tenant") crossTenant++
     else fail++
   }
   button.disabled = false
   button.textContent = originalLabel || "Sync transcripts"
   setStatus(
-    `Container sync complete: ${ok} transcript(s) saved${fail > 0 ? `, ${fail} failed` : ""}.`,
+    `Container sync complete: ${ok} transcript(s) saved${crossTenant > 0 ? `, ${crossTenant} cross-tenant (unavailable)` : ""}${fail > 0 ? `, ${fail} failed` : ""}.`,
   )
 }
 
@@ -2121,20 +2353,22 @@ async function bulkDownloadRecordings(): Promise<void> {
   bulkBtn.disabled = true
   let ok = 0
   let fail = 0
+  let crossTenant = 0
   for (let i = 0; i < markedContainers.length; i++) {
     const container = markedContainers[i]
     bulkBtn.textContent = `Syncing container ${i + 1}/${markedContainers.length}\u2026`
     for (const rec of container.recordings) {
       const tempBtn = document.createElement("button")
-      const success = await downloadRecordingTranscript(rec.id, tempBtn)
-      if (success) ok++
+      const outcome = await downloadRecordingTranscript(rec.id, tempBtn)
+      if (outcome === "ok") ok++
+      else if (outcome === "cross-tenant") crossTenant++
       else fail++
     }
   }
   bulkBtn.disabled = false
   bulkBtn.textContent = originalLabel || ""
   setStatus(
-    `Bulk sync complete: ${ok} recording(s) succeeded${fail > 0 ? `, ${fail} failed` : ""}.`,
+    `Bulk sync complete: ${ok} recording(s) succeeded${crossTenant > 0 ? `, ${crossTenant} cross-tenant (unavailable)` : ""}${fail > 0 ? `, ${fail} failed` : ""}.`,
   )
   updateBulkButtons()
 }

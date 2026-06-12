@@ -44,6 +44,45 @@ function sanitizePath(rawPath: string): string {
   return "/" + cleaned.join("/")
 }
 
+/** Resolve the destination folder's Graph driveItem `webUrl` — the canonical
+ * OneDrive-on-the-web link to open that folder. We read the driveItem metadata
+ * (GET /me/drive/root:/{path}) rather than hand-constructing a SharePoint URL,
+ * which is tenant-specific and fragile.
+ *
+ * Returns null when the folder doesn't exist yet (404 — nothing downloaded
+ * there), when not signed in, or on any error, so the caller hides the link.
+ * This is a PASSIVE convenience read: it acquires the token silently only and
+ * NEVER triggers an interactive redirect (unlike saveBytesToOneDrive, which
+ * needs the scope to do real work). */
+export async function getOneDriveFolderWebUrl(
+  msal: PublicClientApplication,
+  folderPath: string,
+): Promise<string | null> {
+  const account = msal.getActiveAccount()
+  if (!account) return null
+  let token: string
+  try {
+    const r = await msal.acquireTokenSilent({ account, scopes: SCOPES })
+    token = r.accessToken
+  } catch {
+    // Passive link — never force a consent redirect just to populate a URL.
+    return null
+  }
+  const safePath = sanitizePath(folderPath)
+  const encoded = safePath.split("/").filter(Boolean).map(encodeURIComponent).join("/")
+  const url = encoded
+    ? `${GRAPH_BASE}/me/drive/root:/${encoded}`
+    : `${GRAPH_BASE}/me/drive/root`
+  try {
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+    if (!resp.ok) return null // 404 = folder not created yet; anything else = unavailable
+    const item = (await resp.json()) as { webUrl?: string }
+    return item.webUrl ?? null
+  } catch {
+    return null
+  }
+}
+
 /** PUT a raw string (e.g. markdown, text) to a path in the user's OneDrive. */
 export async function saveTextToOneDrive(
   msal: PublicClientApplication,
