@@ -35,10 +35,10 @@ jobs:
         id: builddeploy
         uses: Azure/static-web-apps-deploy@v1
         env:
-          # Public MSAL identifiers (client ID + tenant ID) for the "Team Pulse"
-          # registration the SPA uses to acquire Microsoft Graph delegated tokens.
-          # NOT secrets — sourced from GitHub repo Variables, injected into the
-          # in-action Oryx build so Vite picks them up via import.meta.env.
+          # Public MSAL identifiers for the "Team Pulse" Graph registration the SPA
+          # uses to acquire Microsoft Graph delegated tokens. NOT secrets — sourced
+          # from GitHub repo Variables, injected into the in-action Oryx build so
+          # Vite bakes them via import.meta.env.
           VITE_MSAL_CLIENT_ID: ${{ vars.VITE_MSAL_CLIENT_ID }}
           VITE_MSAL_TENANT_ID: ${{ vars.VITE_MSAL_TENANT_ID }}
         with:
