@@ -426,7 +426,10 @@ export async function listRecordings(
         }
         const resp: MemberResponse = await graphJson(
           msal,
-          `/me/chats/${encodeURIComponent(chatId)}/members?$top=50`,
+          // NOTE: Graph rejects $top on /chats/{id}/members ("Query option 'Top'
+          // is not allowed") — unlike /chats and /messages. Fetch without it;
+          // chat member counts are small, so the default page returns all.
+          `/me/chats/${encodeURIComponent(chatId)}/members`,
           ["ChatMember.Read"],
         )
         const members: Participant[] = []
