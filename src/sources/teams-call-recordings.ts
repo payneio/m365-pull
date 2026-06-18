@@ -17,6 +17,7 @@
 // (Graph /shares -> driveItem -> _api/v2.1 with media/transcripts expansion).
 
 import type { PublicClientApplication } from "@azure/msal-browser"
+import { sanitizeFilenameName, formatPulledStamp, formatDateStamp } from "./filename-format"
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 const SCOPES = ["Chat.Read"]
@@ -504,32 +505,36 @@ export async function listRecordings(
   }
 }
 
-/** Build a human-readable, conflict-resistant filename for a recording's
- * transcript file. Format: <YYYY-MM-DD>-<HHMM>-<subject>-<callIdShort>.<ext>
+/** Build a versioned, sort-by-name-friendly filename for a recording's
+ * transcript (Phase 3). Format:
+ *
+ *   <Name>__rec-<callYYYY-MM-DD>__pulled-<YYYY-MM-DD-HHMM>.transcript.<ext>
+ *
+ * - <Name>          = sanitized subject (keeps human-readable spaces)
+ * - rec-<callDate>   = the call's own immutable date (its identity)
+ * - pulled-<...>      = when THIS transcript was downloaded (primary version key)
+ *
+ * Because rec-<callDate> is fixed per call and pulled-<...> changes per download,
+ * the recurring weekly occurrences of a meeting each get a distinct rec- date,
+ * and re-pulls of the same call get distinct pulled- stamps — so sort-by-name
+ * groups a chat's recordings by call date and, within a call, by pull time.
  *
  * The subject is derived from (in order):
  *   1. chat topic, when set (scheduled meetings, named group chats)
  *   2. "with <other person>" for 1:1 chats (skips self by oid)
- *   3. the raw recording filename, stripped of its Teams-injected
- *      "-YYYYMMDD_HHMMSS" suffix and ".mp4" extension
+ *   3. the raw recording filename, stripped of its Teams-injected suffix/ext
  *
  * Examples:
- *   2026-05-26-1207-Marc-Catch-Up-6674e488.md       (scheduled meeting)
- *   2026-05-26-1436-with-Diego-Colombo-91703f65.md  (1:1 ad-hoc call)
- *   2026-05-21-0856-Show-and-Tell-MADE-fbc0311f.md  (chat-originated call)
- *
- * The 8-char callId suffix keeps it unique across same-subject calls without
- * dominating the filename. Subject is capped at 60 chars after slugification.
+ *   Marc Catch-Up__rec-2026-05-26__pulled-2026-06-17-1250.transcript.md
+ *   with Diego Colombo__rec-2026-05-26__pulled-2026-06-17-1250.transcript.md
  */
 export function buildTranscriptFilename(
   r: RecordingItem,
   userOid: string | null,
   extension: string,
 ): string {
-  const d = new Date(r.eventCreatedDateTime)
-  const pad = (n: number) => String(n).padStart(2, "0")
-  const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
-  const timeStr = `${pad(d.getHours())}${pad(d.getMinutes())}`
+  const callDate = formatDateStamp(new Date(r.eventCreatedDateTime))
+  const pulled = formatPulledStamp(new Date())
 
   let subject = ""
   if (r.chatTopic && r.chatTopic.trim()) {
@@ -553,16 +558,10 @@ export function buildTranscriptFilename(
       "recording"
   }
 
-  const slug = subject
-    .replace(/[^a-zA-Z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60)
-    .replace(/-+$/g, "") || "recording"
-
-  const shortId = r.callId.replace(/-/g, "").slice(0, 8) || "unknown"
+  const name = sanitizeFilenameName(subject)
   const ext = extension.startsWith(".") ? extension : `.${extension}`
 
-  return `${dateStr}-${timeStr}-${slug}-${shortId}${ext}`
+  return `${name}__rec-${callDate}__pulled-${pulled}.transcript${ext}`
 }
 
 /** Parse ISO 8601 duration to seconds (best-effort, handles PT?H?M?S). */

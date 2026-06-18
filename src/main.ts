@@ -8,7 +8,9 @@ import {
   chatDisplayName,
   buildChatArchiveFilename,
   type TeamsChatItem,
+  type TeamsChatMessage,
 } from "./sources/teams-chats"
+import { formatDateStamp } from "./sources/filename-format"
 import {
   listRecordings,
   buildTranscriptFilename,
@@ -173,10 +175,8 @@ let recordingsState: RecordingsState = { containers: [], chatsScanned: 0, trunca
 /** Fast lookup: chatId \u2192 RecordingContainer (populated by background recordings scan). */
 let recordingsMap: Map<string, RecordingContainer> = new Map()
 /** True while the background recordings scan is running; rows show pending indicator. */
-let recordingsPending = false
 /** True after the background recordings scan has completed (success or error); distinguishes
  * "no entry yet — still checking" from "no entry — scan done, couldn't determine". */
-let recordingsScanFinished = false
 
 let filterState: FilterState = {
   search: "",
@@ -196,6 +196,12 @@ let userPrefs: UserPrefs = {
 let syncStatus: SyncStatus = "idle"
 let lastSyncedAt: Date | null = null
 let lastSyncError: string | null = null
+
+/** Ephemeral artifact selection — NOT synced, NOT in OneDrive AppState.
+ * Key format: "msg:{chatId}" for Messages, "rec:{rec.id}" for Recordings. */
+const selectedArtifacts: Set<string> = new Set()
+/** Ephemeral expand state — NOT persisted across page reloads. */
+const expandedChatIds: Set<string> = new Set()
 
 // ----- Helpers -----
 
@@ -223,6 +229,118 @@ function formatDateShort(d: Date): string {
     month: "short",
     day: "numeric",
   })
+}
+
+/** Format an ISO 8601 duration (e.g. "PT15M1.826S") into a readable string like "15m 1s". */
+function formatIsoDuration(iso: string): string {
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?/)
+  if (!m) return iso
+  const h = parseInt(m[1] || "0", 10)
+  const min = parseInt(m[2] || "0", 10)
+  const sec = Math.floor(parseFloat(m[3] || "0"))
+  const parts: string[] = []
+  if (h > 0) parts.push(`${h}h`)
+  if (min > 0) parts.push(`${min}m`)
+  if (sec > 0 || parts.length === 0) parts.push(`${sec}s`)
+  return parts.join(" ")
+}
+
+/** All artifact IDs for a chat: "msg:{chatId}" + "rec:{rec.id}" for each confirmed recording. */
+function getArtifactIds(chatId: string, recContainer: RecordingContainer | undefined): string[] {
+  const ids: string[] = [`msg:${chatId}`]
+  if (recContainer && recContainer.recordings.length > 0) {
+    recContainer.recordings.forEach((r) => ids.push(`rec:${r.id}`))
+  }
+  return ids
+}
+
+// ----- Phase 2 favorites: per-stream keys over the existing synced `marks` set -----
+//
+// A chat has up to TWO favorite targets, both stored in the SAME `markedIds`
+// string set (so the additive union merge in onedrive-state.ts keeps working):
+//   - messages stream   -> bare `chatId`            (matches the legacy v1 key)
+//   - recordings stream  -> `${chatId}::rec`         (collision-safe suffix)
+// A bare chatId never contains "::", so the two keyspaces never overlap, and a
+// recordings-stream key can never be mistaken for the old per-recording
+// `callId::filename` marks (those are dropped on migration).
+
+const REC_STREAM_SUFFIX = "::rec"
+
+/** localStorage key tracking whether the Phase 2 favorites migration has run. */
+function favMigrationKey(userKey: string): string {
+  return `m365-pull.favver.${userKey}`
+}
+function favSchemaVersion(userKey: string): number {
+  try {
+    return parseInt(localStorage.getItem(favMigrationKey(userKey)) || "1", 10) || 1
+  } catch {
+    return 1
+  }
+}
+function setFavSchemaVersion(userKey: string, v: number): void {
+  try {
+    localStorage.setItem(favMigrationKey(userKey), String(v))
+  } catch {
+    /* ignore quota / disabled storage */
+  }
+}
+
+function recStreamKey(chatId: string): string {
+  return `${chatId}${REC_STREAM_SUFFIX}`
+}
+function isMessagesFavorited(chatId: string): boolean {
+  return markedIds.has(chatId)
+}
+function isRecordingsFavorited(chatId: string): boolean {
+  return markedIds.has(recStreamKey(chatId))
+}
+/** True when EITHER stream of this chat is favorited (drives collapsed ★ state). */
+function isChatFavorited(chatId: string): boolean {
+  return isMessagesFavorited(chatId) || isRecordingsFavorited(chatId)
+}
+/** Map any favorite stream key back to its owning chatId. */
+function favoriteKeyToChatId(key: string): string {
+  return key.endsWith(REC_STREAM_SUFFIX) ? key.slice(0, -REC_STREAM_SUFFIX.length) : key
+}
+/** Distinct chatIds that have at least one favorited stream. */
+function favoritedChatIds(): Set<string> {
+  return new Set([...markedIds].map(favoriteKeyToChatId))
+}
+
+/** Migrate a marks set in place from legacy (v1, whole-container bare-chatId) to
+ * Phase 2 (v2, per-stream). For each legacy bare-chatId keep, ALSO favorite the
+ * recordings stream (chatId::rec) so nothing the user previously kept is lost.
+ * Drops the truly-legacy per-recording `callId::filename` and `rec:` marks.
+ * Idempotent while marks are still in their pre-toggle (legacy) shape; gated by
+ * the caller so it isn't re-run after the user starts toggling streams. */
+function migrateMarksToStreams(marks: Set<string>): boolean {
+  let changed = false
+  for (const id of [...marks]) {
+    if (id.endsWith(REC_STREAM_SUFFIX)) {
+      continue // already a Phase 2 recordings-stream key
+    }
+    if (id.startsWith("rec:")) {
+      // Pre-Phase-1 prefixed recording-container mark -> normalize to both streams.
+      const bare = id.slice(4)
+      marks.delete(id)
+      marks.add(bare)
+      marks.add(recStreamKey(bare))
+      changed = true
+      continue
+    }
+    if (id.includes("::")) {
+      // Legacy per-recording mark (callId::filename) from a much older build -> drop.
+      marks.delete(id)
+      changed = true
+      continue
+    }
+    // Bare chatId = legacy whole-container keep -> favorite the recordings stream too.
+    if (!marks.has(recStreamKey(id))) {
+      marks.add(recStreamKey(id))
+      changed = true
+    }
+  }
+  return changed
 }
 
 /** True iff a preview is a system event that represents REAL meeting/call
@@ -430,7 +548,7 @@ function typeLabel(type: string): string {
 
 function buildLocalState(): AppState {
   return {
-    version: 1,
+    version: 2,
     updatedAt: new Date().toISOString(),
     updatedBy: deviceIdentifier(),
     marks: [...markedIds].sort(),
@@ -452,7 +570,7 @@ function updateSyncIndicator(): void {
     case "idle":
       text = "not synced"
       cls += " idle"
-      title = "Sign in to sync marks across devices"
+      title = "Sign in to sync favorites across devices"
       break
     case "syncing":
       text = "syncing\u2026"
@@ -464,7 +582,7 @@ function updateSyncIndicator(): void {
         ? `synced ${formatAge(Date.now() - lastSyncedAt.getTime())}`
         : "synced"
       cls += " synced"
-      title = "Marks are saved to OneDrive (/Apps/m365-pull/state.json)"
+      title = "Favorites are saved to OneDrive (/Apps/m365-pull/state.json)"
       break
     case "error":
       text = "sync error"
@@ -474,7 +592,7 @@ function updateSyncIndicator(): void {
     case "offline":
       text = "offline \u00b7 local only"
       cls += " offline"
-      title = "Could not reach OneDrive; marks stay on this device"
+      title = "Could not reach OneDrive; favorites stay on this device"
       break
   }
   badge.textContent = text
@@ -533,6 +651,17 @@ async function pullAndMergeOneDriveState(): Promise<void> {
     const local = buildLocalState()
     const merged = mergeStates(local, remote)
     const mergedMarks = new Set(merged.marks)
+    // Phase 2 migration for marks arriving from a legacy (v1) remote state: a v1
+    // remote holds only whole-container bare-chatId keeps, so promoting each to
+    // favorite BOTH streams is safe and one-time (mergeStates already stamps the
+    // written-back state as v2, so this path never re-fires once OneDrive is v2).
+    if (remote?.version === 1) {
+      migrateMarksToStreams(mergedMarks)
+      // Persist the migrated marks back through `merged` so the OneDrive writeback
+      // below stores v2 with BOTH streams — not the stale pre-migration set (which
+      // would silently drop the recordings-stream favorites until the next save).
+      merged.marks = [...mergedMarks].sort()
+    }
     const marksChanged =
       mergedMarks.size !== markedIds.size ||
       [...mergedMarks].some((id) => !markedIds.has(id))
@@ -600,7 +729,7 @@ function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
       if (isIgnored) return false
     }
     if (!filterState.enabledTypes.has(c.chatType)) return false
-    if (filterState.markedOnly && !markedIds.has(c.id)) return false
+    if (filterState.markedOnly && !isChatFavorited(c.id)) return false
     // hideDownloaded: hide containers where the chat archive has been downloaded
     if (userPrefs.hideDownloaded && chatPrefs[c.id]?.lastSync) return false
     if (q) {
@@ -619,8 +748,8 @@ function applyContainerFiltersAndSort(chats: TeamsChatItem[]): TeamsChatItem[] {
     result = [...result].sort(byRecent)
   } else {
     result = [...result].sort((a, b) => {
-      const aM = markedIds.has(a.id) ? 1 : 0
-      const bM = markedIds.has(b.id) ? 1 : 0
+      const aM = isChatFavorited(a.id) ? 1 : 0
+      const bM = isChatFavorited(b.id) ? 1 : 0
       if (aM !== bM) return bM - aM
       return byRecent(a, b)
     })
@@ -660,24 +789,20 @@ function render(): void {
 
   markedIds = loadMarks(userCacheKey())
   ignoredIds = loadIgnored(userCacheKey())
-  // Migrate: drop old per-recording marks that used the callId::filename composite key.
-  // Migrate: drop rec: prefix \u2014 unify recording container marks to bare chatId.
-  let migratedMarks = false
-  for (const id of [...markedIds]) {
-    if (id.includes("::")) {
-      markedIds.delete(id)
-      migratedMarks = true
+  // Phase 2 favorites migration (gated, runs once per device): legacy v1 marks
+  // are whole-container keeps stored as bare chatIds. Convert each to favorite
+  // BOTH streams (keep the bare chatId for messages + add chatId::rec for
+  // recordings) so nothing previously kept is lost. The local fav-schema flag
+  // prevents re-running after the user starts toggling streams independently
+  // (which would otherwise resurrect a deliberately un-favorited stream). Marks
+  // arriving later via the OneDrive merge are handled in pullAndMergeOneDriveState
+  // (gated on the remote state's own version).
+  if (favSchemaVersion(userCacheKey()) < 2) {
+    if (migrateMarksToStreams(markedIds)) {
+      saveMarks(userCacheKey(), markedIds)
     }
+    setFavSchemaVersion(userCacheKey(), 2)
   }
-  for (const id of [...markedIds]) {
-    if (id.startsWith("rec:")) {
-      const bareId = id.slice(4)
-      markedIds.delete(id)
-      markedIds.add(bareId)
-      migratedMarks = true
-    }
-  }
-  if (migratedMarks) saveMarks(userCacheKey(), markedIds)
   chatPrefs = loadChatPrefs(userCacheKey())
   recordingPrefs = loadRecordingPrefs(userCacheKey())
   userPrefs = loadUserPrefs(userCacheKey())
@@ -722,7 +847,7 @@ function render(): void {
           <div class="form-field">
             <span class="form-label">State storage</span>
             <span class="form-static"><code>/Apps/m365-pull/state.json</code> in your OneDrive</span>
-            <span class="form-help">Marks, last-download timestamps, and these settings sync across all your devices via this single file.</span>
+            <span class="form-help">Favorites, last-download timestamps, and these settings sync across all your devices via this single file.</span>
           </div>
         </div>
         <footer class="modal-footer">
@@ -759,7 +884,7 @@ function render(): void {
           <span class="label">to</span>
           <input type="date" id="chat-to" title="To (inclusive)" />
         </span>
-        <button class="chip" id="marked-include" title="Always show marked containers regardless of range">\u2605 Always include marked</button>
+        <button class="chip" id="marked-include" title="Always show favorited containers regardless of range">\u2605 Always include favorites</button>
         <span class="label" aria-hidden="true" style="opacity:0.35;padding:0 0.25rem;">\u2502</span>
         <span class="label">Download history:</span>
         <select id="lookback" title="Download history per chat (messages)">
@@ -773,6 +898,7 @@ function render(): void {
         <button class="chip active" id="include-messages" title="Include chat message archives when downloading a container">Include: Messages</button>
         <button class="chip active" id="include-recordings" title="Include call transcripts when downloading a container">Include: Transcripts</button>
         <button id="bulk-containers" class="bulk-action" hidden></button>
+        <button id="download-selected" class="bulk-action" hidden></button>
       </div>
       <div id="scan-status" class="scan-status"></div>
 
@@ -787,12 +913,12 @@ function render(): void {
         <label class="sort-label">
           Sort
           <select id="sortby">
-            <option value="marked-first">Marked first \u00b7 then recent</option>
+            <option value="marked-first">Favorites first \u00b7 then recent</option>
             <option value="recent">Most recent activity</option>
             <option value="name">Name (A\u2013Z)</option>
           </select>
         </label>
-        <button class="chip marked-only" id="markedonly">\u2605 Marked only</button>
+        <button class="chip marked-only" id="markedonly">\u2605 Favorites only</button>
         <button class="chip show-ignored" id="showignored">\u2298 Show ignored</button>
         <button class="chip clear-ignored" id="clearignored" hidden>\u2298 Clear all ignored</button>
         <button class="chip" id="hide-downloaded">Hide downloaded</button>
@@ -822,9 +948,14 @@ function wireGlobalHandlers(account: AccountInfo): void {
     void refreshChats()
   })
 
-  // Bulk sync button
+  // Sync favorites button (pulls every favorited stream on click)
   el<HTMLButtonElement>("bulk-containers").addEventListener("click", () => {
-    void bulkSyncContainers()
+    void syncFavorites()
+  })
+
+  // Phase 1: Download selected button
+  el<HTMLButtonElement>("download-selected").addEventListener("click", () => {
+    void downloadSelectedArtifacts()
   })
 
   // Chat range dropdown + custom date inputs \u2014 persisted to OneDrive userPrefs
@@ -853,8 +984,6 @@ function wireGlobalHandlers(account: AccountInfo): void {
       chatsState = { chats: [] }
       recordingsState = { containers: [], chatsScanned: 0, truncated: false }
       recordingsMap = new Map()
-      recordingsPending = false
-      recordingsScanFinished = false
       el<HTMLUListElement>("chats").innerHTML = ""
       void initialLoadChats()
     }
@@ -875,8 +1004,6 @@ function wireGlobalHandlers(account: AccountInfo): void {
       chatsState = { chats: [] }
       recordingsState = { containers: [], chatsScanned: 0, truncated: false }
       recordingsMap = new Map()
-      recordingsPending = false
-      recordingsScanFinished = false
       el<HTMLUListElement>("chats").innerHTML = ""
       void initialLoadChats()
     }
@@ -897,8 +1024,6 @@ function wireGlobalHandlers(account: AccountInfo): void {
       chatsState = { chats: [] }
       recordingsState = { containers: [], chatsScanned: 0, truncated: false }
       recordingsMap = new Map()
-      recordingsPending = false
-      recordingsScanFinished = false
       el<HTMLUListElement>("chats").innerHTML = ""
       void initialLoadChats()
     }
@@ -1112,7 +1237,7 @@ function rerenderContainerList(): void {
   if (filtered.length === 0) {
     list.innerHTML = `<li class="empty">No containers match these filters. ${
       filterState.markedOnly
-        ? "Star some containers from the list to add them here."
+        ? "Favorite a chat\u2019s Messages or Recordings stream (expand a row) to add it here."
         : "Loosen the filters."
     }</li>`
   } else {
@@ -1126,9 +1251,15 @@ function rerenderContainerList(): void {
         void syncContainer(id, name, btn)
       })
     })
-    list.querySelectorAll<HTMLButtonElement>(".mark-toggle").forEach((btn) => {
+    // --- Phase 2: per-stream favorite toggles (live in the expanded view) ---
+    list.querySelectorAll<HTMLButtonElement>(".fav-toggle").forEach((btn) => {
       btn.addEventListener("click", () => {
-        toggleMark(btn.dataset.chatId!)
+        const chatId = btn.dataset.chatId!
+        if (btn.dataset.stream === "recordings") {
+          toggleFavoriteRecordings(chatId)
+        } else {
+          toggleFavoriteMessages(chatId)
+        }
       })
     })
     list.querySelectorAll<HTMLButtonElement>(".ignore-toggle").forEach((btn) => {
@@ -1136,16 +1267,98 @@ function rerenderContainerList(): void {
         toggleIgnore(btn.dataset.chatId!)
       })
     })
+
+    // --- Phase 1: expand/collapse ---
+    list.querySelectorAll<HTMLButtonElement>(".expand-toggle").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const chatId = btn.dataset.chatId!
+        const li = btn.closest<HTMLLIElement>("li.chat-row")
+        const artifactRowsDiv = li?.querySelector<HTMLDivElement>(".artifact-rows")
+        if (!li || !artifactRowsDiv) return
+        if (expandedChatIds.has(chatId)) {
+          expandedChatIds.delete(chatId)
+          artifactRowsDiv.hidden = true
+          btn.setAttribute("aria-expanded", "false")
+          btn.textContent = "\u25b8"
+          btn.title = "Expand artifacts"
+          li.classList.remove("expanded")
+        } else {
+          expandedChatIds.add(chatId)
+          artifactRowsDiv.hidden = false
+          btn.setAttribute("aria-expanded", "true")
+          btn.textContent = "\u25be"
+          btn.title = "Collapse artifacts"
+          li.classList.add("expanded")
+        }
+      })
+    })
+
+    // --- Phase 1: select-all checkboxes (group level) ---
+    list.querySelectorAll<HTMLInputElement>(".select-all-check").forEach((cb) => {
+      // Set indeterminate for "some but not all selected" — can't do via HTML attr
+      const chatId = cb.dataset.chatId!
+      const rc = recordingsMap.get(chatId)
+      const aids = getArtifactIds(chatId, rc)
+      const selCount = aids.filter((id) => selectedArtifacts.has(id)).length
+      if (selCount > 0 && selCount < aids.length) cb.indeterminate = true
+
+      cb.addEventListener("change", () => {
+        const cid = cb.dataset.chatId!
+        const container = recordingsMap.get(cid)
+        const artifactIds = getArtifactIds(cid, container)
+        if (cb.checked) {
+          artifactIds.forEach((id) => selectedArtifacts.add(id))
+        } else {
+          artifactIds.forEach((id) => selectedArtifacts.delete(id))
+        }
+        cb.indeterminate = false
+        // Sync individual artifact checkboxes
+        list.querySelectorAll<HTMLInputElement>(".artifact-check").forEach((artCb) => {
+          if (artifactIds.includes(artCb.dataset.artifactId ?? "")) {
+            artCb.checked = cb.checked
+          }
+        })
+        updateSelectedButton()
+      })
+    })
+
+    // --- Phase 1: individual artifact checkboxes ---
+    list.querySelectorAll<HTMLInputElement>(".artifact-check").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        const artifactId = cb.dataset.artifactId!
+        const chatId = cb.closest<HTMLDivElement>(".artifact-row")?.dataset.chatId ?? ""
+        if (cb.checked) {
+          selectedArtifacts.add(artifactId)
+        } else {
+          selectedArtifacts.delete(artifactId)
+        }
+        // Update the group select-all checkbox for this chat
+        if (chatId) {
+          const rc = recordingsMap.get(chatId)
+          const aids = getArtifactIds(chatId, rc)
+          const sc = aids.filter((id) => selectedArtifacts.has(id)).length
+          list.querySelectorAll<HTMLInputElement>(".select-all-check").forEach((groupCb) => {
+            if (groupCb.dataset.chatId === chatId) {
+              if (sc === 0) { groupCb.checked = false; groupCb.indeterminate = false }
+              else if (sc === aids.length) { groupCb.checked = true; groupCb.indeterminate = false }
+              else { groupCb.checked = false; groupCb.indeterminate = true }
+            }
+          })
+        }
+        updateSelectedButton()
+      })
+    })
   }
   updateTypeCountChips()
   updateFiltersVisibility()
   updateContainerSummary(filtered.length)
   updateBulkButtons()
+  updateSelectedButton()
 }
 
 function updateContainerSummary(visible: number): void {
   const total = chatsState.chats.length
-  const marked = markedIds.size
+  const favorited = favoritedChatIds().size
   const ignored = ignoredIds.size
   const ignoredNote = ignored > 0 ? ` \u00b7 ${ignored} ignored` : ""
   // "Clear all ignored" is only relevant when something is ignored.
@@ -1154,9 +1367,9 @@ function updateContainerSummary(visible: number): void {
   // Recording scan progress lives in #scan-status (Item 4); omit from main status.
   const filtered = visible < total
   if (filtered) {
-    setStatus(`Showing ${visible} of ${total} loaded \u00b7 ${marked} marked${ignoredNote}`)
+    setStatus(`Showing ${visible} of ${total} loaded \u00b7 ${favorited} favorited${ignoredNote}`)
   } else {
-    setStatus(`${total} containers loaded \u00b7 ${marked} marked${ignoredNote}`)
+    setStatus(`${total} containers loaded \u00b7 ${favorited} favorited${ignoredNote}`)
   }
 }
 
@@ -1165,7 +1378,7 @@ function renderContainerRow(
   recContainer: RecordingContainer | undefined,
 ): string {
   const name = chatDisplayName(chat)
-  const isMarked = markedIds.has(chat.id)
+  const isMarked = isChatFavorited(chat.id)
   const isIgnored = ignoredIds.has(chat.id)
   const lastSync = chatPrefs[chat.id]?.lastSync
   // Item 5: capitalise "Downloaded"; make no-download state explicit.
@@ -1174,31 +1387,16 @@ function renderContainerRow(
     : " \u00b7 Not downloaded yet"
   const sub = `${typeLabel(chat.chatType)} \u00b7 last activity ${formatDate(new Date(chatActivityDate(chat)).toISOString())}${downloadedTag}`
 
-  // Item 1: four honest recording indicator states.
-  // The \uD83C\uDF99 (🎙) glyph is decorative — hidden from AT via aria-hidden="true" on the
-  // inner span; meaning is carried by the outer span's aria-label.
-  let recIndicatorHtml: string
+  // Phase 1 recording indicator: only show badge when recordings are confirmed.
+  // All other states (pending, none, unknown) = silence ("no-recording = silence" design).
+  let recIndicatorHtml = ""
   if (recContainer !== undefined && recContainer.recordings.length > 0) {
-    // State A: scan finished, has recordings
     const n = recContainer.recordings.length
     const truncNote = recContainer.truncated ? " (may be incomplete)" : ""
     recIndicatorHtml = `<span class="rec-indicator" aria-label="${n} recording${n !== 1 ? "s" : ""}${truncNote}" title="${n} recording${n !== 1 ? "s" : ""} in range${truncNote}"><span aria-hidden="true">\uD83C\uDF99 ${n}</span></span>`
-  } else if (recordingsPending && recContainer === undefined) {
-    // State B: scan in progress, no result yet for this chat
-    recIndicatorHtml = `<span class="rec-indicator rec-pending" aria-label="checking for recordings" title="Checking for recordings\u2026"><span aria-hidden="true">\uD83C\uDF99 checking\u2026</span></span>`
-  } else if (recordingsScanFinished && recContainer !== undefined && recContainer.recordings.length === 0) {
-    // State C: scan done, confirmed no recordings in range
-    recIndicatorHtml = `<span class="rec-indicator rec-none" aria-label="no recordings" title="No recordings in range"><span aria-hidden="true">\uD83C\uDF99 none</span></span>`
-  } else if (recordingsScanFinished && recContainer === undefined) {
-    // State D: scan done, no entry — couldn't determine (~60% of meeting chats).
-    // No cheap single-container resolve path available; rendered as a non-interactive marker.
-    recIndicatorHtml = `<span class="rec-indicator rec-unknown" aria-label="recordings unknown \u2014 could not resolve" title="Could not determine recordings for this chat"><span aria-hidden="true">\uD83C\uDF99 ?</span></span>`
-  } else {
-    // Scan not yet started (chats loaded before scan kicked off) — treat same as pending.
-    recIndicatorHtml = `<span class="rec-indicator rec-pending" aria-label="checking for recordings" title="Checking for recordings\u2026"><span aria-hidden="true">\uD83C\uDF99 checking\u2026</span></span>`
   }
 
-  // Item 3: effective download scope = toggles ∩ what this row actually has.
+  // Effective download scope = toggles \u2229 what this row actually has.
   const wantMessages = userPrefs.includeMessages !== false
   const hasRecordings = recContainer !== undefined && recContainer.recordings.length > 0
   const wantRecordings = userPrefs.includeRecordings !== false && hasRecordings
@@ -1222,32 +1420,135 @@ function renderContainerRow(
     downloadBtnAriaLabel = "Download \u2014 nothing to download for current Include settings"
   }
 
-  // Item 2: aria-pressed reflects toggle state for screen readers.
+  // Phase 1 expand/select-all state
+  const isExpanded = expandedChatIds.has(chat.id)
+  const artifactIds = getArtifactIds(chat.id, recContainer)
+  const selectedCount = artifactIds.filter((id) => selectedArtifacts.has(id)).length
+  const allSelected = selectedCount > 0 && selectedCount === artifactIds.length
+  // indeterminate state (someSelected) must be set via JS after render \u2014 not expressible in HTML
+
   return `
-    <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}">
-      <button class="mark-toggle${isMarked ? " marked" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isMarked ? "Remove keep mark" : "Keep this container"}" aria-label="${isMarked ? "Remove keep mark" : "Keep"}" aria-pressed="${isMarked ? "true" : "false"}">${isMarked ? "\u2605" : "\u2606"}</button>
-      <div class="chat-info">
-        <div class="chat-name">${escapeHtml(name)}</div>
-        <div class="chat-sub">${escapeHtml(sub)}</div>
+    <li class="chat-row${isMarked ? " marked" : ""}${isIgnored ? " ignored" : ""}${isExpanded ? " expanded" : ""}">
+      <div class="chat-row-header">
+        <button class="expand-toggle" data-chat-id="${escapeHtml(chat.id)}" aria-expanded="${isExpanded ? "true" : "false"}" title="${isExpanded ? "Collapse artifacts" : "Expand artifacts"}">${isExpanded ? "\u25be" : "\u25b8"}</button>
+        <input type="checkbox" class="select-all-check" data-chat-id="${escapeHtml(chat.id)}"${allSelected ? " checked" : ""} title="Select all artifacts in this chat" aria-label="Select all artifacts for ${escapeHtml(name)}">
+        <span class="fav-state${isMarked ? " favorited" : ""}" title="${isMarked ? "Favorited \u2014 expand to change which streams" : "Not favorited \u2014 expand to favorite a stream"}" aria-label="${isMarked ? "Favorited" : "Not favorited"}">${isMarked ? "\u2605" : "\u2606"}</span>
+        <div class="chat-info">
+          <div class="chat-name">${escapeHtml(name)}</div>
+          <div class="chat-sub">${escapeHtml(sub)}</div>
+        </div>
+        ${recIndicatorHtml}
+        <button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
+        <button class="container-action"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>
       </div>
-      ${recIndicatorHtml}
-      <button class="ignore-toggle${isIgnored ? " ignored" : ""}" data-chat-id="${escapeHtml(chat.id)}" title="${isIgnored ? "Un-ignore this container" : "Ignore this container"}" aria-label="${isIgnored ? "Un-ignore" : "Ignore"}" aria-pressed="${isIgnored ? "true" : "false"}">${isIgnored ? "\u2299" : "\u2298"}</button>
-      <button class="container-action"${downloadBtnDisabled} data-chat-id="${escapeHtml(chat.id)}" data-chat-name="${escapeHtml(name)}" aria-label="${downloadBtnAriaLabel}"${downloadBtnTitle}>${downloadBtnInner}</button>
+      <div class="artifact-rows"${isExpanded ? "" : " hidden"}>
+        ${renderArtifactRows(chat, recContainer)}
+      </div>
     </li>
   `
 }
 
-/** Toggle a mark on a container (bare chatId). Marking clears the ignored state (tri-state axis). */
-function toggleMark(id: string): void {
-  if (markedIds.has(id)) {
-    markedIds.delete(id)
-  } else {
-    markedIds.add(id)
-    // Item 2: Keep and Ignore are mutually exclusive (tri-state: Kept / Inbox / Ignored).
-    if (ignoredIds.has(id)) {
-      ignoredIds.delete(id)
-      saveIgnored(userCacheKey(), ignoredIds)
+/** Render the expanded artifact rows (Messages + per-recording) for a chat.
+ * Called by renderContainerRow; reads selectedArtifacts for checkbox state. */
+function renderArtifactRows(
+  chat: TeamsChatItem,
+  recContainer: RecordingContainer | undefined,
+): string {
+  const chatId = chat.id
+  const lastSync = chatPrefs[chatId]?.lastSync
+  const msgsTag = lastSync
+    ? `Downloaded ${formatDateShort(new Date(lastSync))}`
+    : "Not downloaded yet"
+  const msgArtId = `msg:${chatId}`
+  const msgSelected = selectedArtifacts.has(msgArtId)
+  const msgFav = isMessagesFavorited(chatId)
+
+  let html = `
+    <div class="artifact-row" data-artifact-id="${escapeHtml(msgArtId)}" data-chat-id="${escapeHtml(chatId)}">
+      <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(msgArtId)}"${msgSelected ? " checked" : ""} aria-label="Select Messages artifact">
+      <button class="fav-toggle${msgFav ? " favorited" : ""}" data-stream="messages" data-chat-id="${escapeHtml(chatId)}" title="${msgFav ? "Un-favorite the Messages stream" : "Favorite the Messages stream \u2014 synced on every Sync"}" aria-label="${msgFav ? "Un-favorite Messages stream" : "Favorite Messages stream"}" aria-pressed="${msgFav ? "true" : "false"}">${msgFav ? "\u2605" : "\u2606"}</button>
+      <span class="artifact-type-icon" aria-hidden="true">\uD83D\uDCAC</span>
+      <div class="artifact-info">
+        <div class="artifact-name">Messages</div>
+        <div class="artifact-sub">${escapeHtml(msgsTag)}</div>
+      </div>
+    </div>
+  `
+
+  if (recContainer && recContainer.recordings.length > 0) {
+    const n = recContainer.recordings.length
+    const recFav = isRecordingsFavorited(chatId)
+    // Recordings-stream favorite lives on a group header (the stream is the unit;
+    // individual recordings are immutable and not separately favoritable).
+    html += `
+      <div class="artifact-group-header" data-chat-id="${escapeHtml(chatId)}">
+        <button class="fav-toggle${recFav ? " favorited" : ""}" data-stream="recordings" data-chat-id="${escapeHtml(chatId)}" title="${recFav ? "Un-favorite the Recordings stream" : "Favorite the Recordings stream \u2014 grabs all recordings on every Sync"}" aria-label="${recFav ? "Un-favorite Recordings stream" : "Favorite Recordings stream"}" aria-pressed="${recFav ? "true" : "false"}">${recFav ? "\u2605" : "\u2606"}</button>
+        <span class="artifact-group-label">Recordings (${n})</span>
+      </div>
+    `
+    for (const rec of recContainer.recordings) {
+      const recArtId = `rec:${rec.id}`
+      const recSelected = selectedArtifacts.has(recArtId)
+      const dateLabel = formatDate(rec.eventCreatedDateTime)
+      const duration = formatIsoDuration(rec.durationIso)
+      const attendees = rec.participants
+        .filter((p) => p.kind === "user")
+        .map((p) => p.displayName)
+        .filter(Boolean)
+        .join(", ")
+      const recLastSync = recordingPrefs[rec.id]?.lastSync
+      const recTag = recLastSync
+        ? ` \u00b7 Downloaded ${formatDateShort(new Date(recLastSync))}`
+        : ""
+      const sub = [duration, attendees].filter(Boolean).join(" \u00b7 ")
+
+      html += `
+        <div class="artifact-row" data-artifact-id="${escapeHtml(recArtId)}" data-chat-id="${escapeHtml(chatId)}">
+          <input type="checkbox" class="artifact-check" data-artifact-id="${escapeHtml(recArtId)}"${recSelected ? " checked" : ""} aria-label="Select Recording artifact">
+          <span class="artifact-type-icon" aria-hidden="true">\uD83C\uDF99</span>
+          <div class="artifact-info">
+            <div class="artifact-name">Recording \u2014 ${escapeHtml(dateLabel)}</div>
+            <div class="artifact-sub">${escapeHtml(sub + recTag)}</div>
+          </div>
+        </div>
+      `
     }
+  }
+
+  return html
+}
+
+/** Favoriting any stream clears the chat's ignored state (Favorite and Ignore
+ * are mutually exclusive — you can't ignore something you're favoriting). */
+function clearIgnoreOnFavorite(chatId: string): void {
+  if (ignoredIds.has(chatId)) {
+    ignoredIds.delete(chatId)
+    saveIgnored(userCacheKey(), ignoredIds)
+  }
+}
+
+/** Toggle the Favorite state of a chat's MESSAGES stream (key = bare chatId). */
+function toggleFavoriteMessages(chatId: string): void {
+  if (markedIds.has(chatId)) {
+    markedIds.delete(chatId)
+  } else {
+    markedIds.add(chatId)
+    clearIgnoreOnFavorite(chatId)
+  }
+  saveMarks(userCacheKey(), markedIds)
+  rerenderContainerList()
+  updateBulkButtons()
+  scheduleOneDriveSave()
+}
+
+/** Toggle the Favorite state of a chat's RECORDINGS stream (key = chatId::rec). */
+function toggleFavoriteRecordings(chatId: string): void {
+  const key = recStreamKey(chatId)
+  if (markedIds.has(key)) {
+    markedIds.delete(key)
+  } else {
+    markedIds.add(key)
+    clearIgnoreOnFavorite(chatId)
   }
   saveMarks(userCacheKey(), markedIds)
   rerenderContainerList()
@@ -1259,16 +1560,19 @@ function toggleMark(id: string): void {
 let undoIgnoreTimer: number | null = null
 let undoIgnoreId: string | null = null
 
-/** Toggle the ignored state for a container. Ignoring clears the keep mark (tri-state axis). */
+/** Toggle the ignored state for a container. Ignoring clears BOTH favorite
+ * streams (Favorite and Ignore are mutually exclusive: Favorited / Inbox / Ignored). */
 function toggleIgnore(id: string): void {
   const wasIgnored = ignoredIds.has(id)
   if (wasIgnored) {
     ignoredIds.delete(id)
   } else {
     ignoredIds.add(id)
-    // Item 2: Keep and Ignore are mutually exclusive (tri-state: Kept / Inbox / Ignored).
-    if (markedIds.has(id)) {
+    // Clear any favorite on either stream of this chat.
+    const recKey = recStreamKey(id)
+    if (markedIds.has(id) || markedIds.has(recKey)) {
       markedIds.delete(id)
+      markedIds.delete(recKey)
       saveMarks(userCacheKey(), markedIds)
     }
   }
@@ -1414,16 +1718,19 @@ async function initialLoadChats(): Promise<void> {
     const markedIncludeOn = userPrefs.markedInclude !== false // default ON
     if (markedIncludeOn && markedIds.size > 0) {
       const keptIds = new Set(kept.map((c) => c.id))
-      const missingMarked = [...markedIds].filter((id) => !keptIds.has(id))
+      // Favorites are per-stream keys; collapse to distinct owning chatIds before
+      // resolving any that fell outside the window (a chatId::rec recordings-stream
+      // favorite must still pull its chat into view).
+      const missingMarked = [...favoritedChatIds()].filter((id) => !keptIds.has(id))
       if (missingMarked.length > 0) {
-        setStatus(`Fetching ${missingMarked.length} marked container(s) outside window\u2026`)
+        setStatus(`Fetching ${missingMarked.length} favorited container(s) outside window\u2026`)
         for (const id of missingMarked) {
           try {
             const chat = await fetchChatById(msal, id)
             if (chat) kept.push(chat)
           } catch (err) {
             console.warn(
-              "[m365-pull] Skipping marked container (fetch failed):",
+              "[m365-pull] Skipping favorited container (fetch failed):",
               id,
               (err as Error).message,
             )
@@ -1469,14 +1776,13 @@ async function initialLoadChats(): Promise<void> {
 }
 
 async function refreshChats(): Promise<void> {
+  selectedArtifacts.clear() // ephemeral — artifact IDs may change after reload
   clearCachedChats(userCacheKey())
   chatsState = { chats: [] }
   el<HTMLUListElement>("chats").innerHTML = ""
   // Reset recordings state; initialLoadChats will re-kick the scan.
   recordingsState = { containers: [], chatsScanned: 0, truncated: false }
   recordingsMap = new Map()
-  recordingsPending = false
-  recordingsScanFinished = false
   await initialLoadChats()
 }
 
@@ -1486,7 +1792,6 @@ async function refreshChats(): Promise<void> {
  * chats load; does NOT block the container list. Renders rows with a pending
  * indicator while scanning, then updates counts when the scan lands. */
 async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<void> {
-  recordingsPending = true
   recordingsMap = new Map()
   rerenderContainerList()
   try {
@@ -1509,8 +1814,6 @@ async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<v
     console.warn("[m365-pull] Recordings scan failed:", err)
     setStatus(`Recordings scan failed: ${(err as Error).message}`, "error")
   } finally {
-    recordingsPending = false
-    recordingsScanFinished = true
     rerenderContainerList()
     setScanStatus("") // clear progress; row indicators show per-row state
   }
@@ -1518,21 +1821,73 @@ async function backgroundLoadRecordings(fromMs: number, toMs: number): Promise<v
 
 // ----- Bulk buttons -----
 
-/** Compute marked containers and update the bulk-sync button. */
+/** Count favorited STREAMS among loaded chats (messages + recordings count
+ * separately) and update the Sync-favorites button. */
+function countFavoritedStreams(): number {
+  let n = 0
+  for (const c of chatsState.chats) {
+    if (isMessagesFavorited(c.id)) n++
+    if (isRecordingsFavorited(c.id)) n++
+  }
+  return n
+}
+
+/** Update the Sync-favorites button. Pulls every favorited stream when clicked. */
 function updateBulkButtons(): void {
-  const markedContainers = chatsState.chats.filter((c) => markedIds.has(c.id))
+  const streams = countFavoritedStreams()
   const containerBtn = document.getElementById("bulk-containers") as HTMLButtonElement | null
   if (containerBtn) {
-    if (markedContainers.length > 0) {
+    if (streams > 0) {
       containerBtn.hidden = false
-      containerBtn.textContent = `Download marked (${markedContainers.length})`
+      containerBtn.textContent = `Sync favorites (${streams})`
+      // Honest copy: there is no backend/background. Sync runs on click.
+      containerBtn.title = "Syncs your favorited chats & recordings now (runs when you click)."
     } else {
       containerBtn.hidden = true
     }
   }
 }
 
+/** Compute selected artifact count and update the #download-selected button label/visibility. */
+function updateSelectedButton(): void {
+  const btn = document.getElementById("download-selected") as HTMLButtonElement | null
+  if (!btn) return
+  const count = selectedArtifacts.size
+  if (count > 0) {
+    btn.hidden = false
+    btn.textContent = `Download selected (${count})`
+  } else {
+    btn.hidden = true
+  }
+}
+
 // ----- Downloading a chat -----
+
+/** Compute the real YYYY-MM-DD span of the messages INCLUDED in a download.
+ * Prefers the actual min/max message timestamps (so "all" and "since last
+ * download" resolve to concrete dates, not the literal words). Falls back to
+ * the resolved query window (since -> today) when no messages were included
+ * (e.g. an empty incremental pull), so the filename still carries a real span. */
+function computeMessageRange(
+  messages: TeamsChatMessage[],
+  since: Date | null,
+): { rangeStart: string; rangeEnd: string } {
+  const times = messages
+    .map((m) => (m.createdDateTime ? new Date(m.createdDateTime).getTime() : NaN))
+    .filter((t) => !Number.isNaN(t))
+  if (times.length > 0) {
+    return {
+      rangeStart: formatDateStamp(new Date(Math.min(...times))),
+      rangeEnd: formatDateStamp(new Date(Math.max(...times))),
+    }
+  }
+  const end = new Date()
+  const start = since ?? end
+  return {
+    rangeStart: formatDateStamp(start),
+    rangeEnd: formatDateStamp(end),
+  }
+}
 
 async function downloadChat(
   chatId: string,
@@ -1578,15 +1933,18 @@ async function downloadChat(
     if (since) opts.since = since
     const messages = await fetchChatMessages(msal, chatId, opts)
     const destination = userPrefs.destination
-    const browserName = buildChatArchiveFilename(chatId, chatName, {
-      withTimestamp: true,
+    const pulledAt = new Date()
+    // Phase 3: versioned name — the real YYYY-MM-DD span of the INCLUDED messages
+    // plus the pulled-at stamp. Same name for BOTH destinations so every pull is
+    // its own dated file (sort-by-name reveals the version history).
+    const { rangeStart, rangeEnd } = computeMessageRange(messages, since)
+    const versionedName = buildChatArchiveFilename(chatName, {
+      pulledAt,
+      rangeStart,
+      rangeEnd,
       extension: ".md",
     })
-    const onedriveName = buildChatArchiveFilename(chatId, chatName, {
-      withTimestamp: false,
-      extension: ".md",
-    })
-    const nowIso = new Date().toISOString()
+    const nowIso = pulledAt.toISOString()
     const chatType = chatsState.chats.find((c) => c.id === chatId)?.chatType ?? "chat"
     const markdownBody = renderChatMarkdown(messages, {
       title: chatName,
@@ -1599,12 +1957,12 @@ async function downloadChat(
 
     let result: { saved: boolean; reason?: string; path?: string; webUrl?: string }
     if (destination === "onedrive") {
-      const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${onedriveName}`
+      const fullPath = `${userPrefs.oneDriveFolder.replace(/\/$/, "")}/${versionedName}`
       setStatus(`${messages.length} messages fetched. Saving to OneDrive (${userPrefs.oneDriveFolder})\u2026`)
       result = await saveTextToOneDrive(msal, fullPath, markdownBody, "text/markdown")
     } else {
       setStatus(`${messages.length} messages fetched. Saving\u2026`)
-      result = await saveAsText(browserName, markdownBody, {
+      result = await saveAsText(versionedName, markdownBody, {
         extension: ".md",
         description: "Markdown",
         mimeType: "text/markdown",
@@ -1872,33 +2230,107 @@ async function syncContainer(
   return anyOk
 }
 
-// ----- Bulk sync (all marked containers) -----
+// ----- Sync favorites (every favorited stream, pulled when the user clicks) -----
 
-async function bulkSyncContainers(): Promise<void> {
-  const marked = chatsState.chats.filter((c) => markedIds.has(c.id))
-  if (marked.length === 0) return
+/** Pull every favorited STREAM among the loaded chats:
+ *   favorited messages stream  -> downloadChat(chatId)
+ *   favorited recordings stream -> all of that chat's recordings
+ * There is NO backend/background — this runs only on click. */
+async function syncFavorites(): Promise<void> {
+  type StreamTask =
+    | { kind: "messages"; chat: TeamsChatItem }
+    | { kind: "recordings"; chat: TeamsChatItem }
+  const tasks: StreamTask[] = []
+  for (const chat of chatsState.chats) {
+    if (isMessagesFavorited(chat.id)) tasks.push({ kind: "messages", chat })
+    if (isRecordingsFavorited(chat.id)) tasks.push({ kind: "recordings", chat })
+  }
+  if (tasks.length === 0) return
+
   const bulkBtn = el<HTMLButtonElement>("bulk-containers")
   const originalLabel = bulkBtn.textContent
   bulkBtn.disabled = true
   let ok = 0
   let fail = 0
-  for (let i = 0; i < marked.length; i++) {
-    const chat = marked[i]
-    bulkBtn.textContent = `Downloading ${i + 1}/${marked.length}\u2026`
+  for (let i = 0; i < tasks.length; i++) {
+    const task = tasks[i]
+    bulkBtn.textContent = `Syncing ${i + 1}/${tasks.length}\u2026`
     const rowBtn =
       (document.querySelector(
-        `.container-action[data-chat-id="${CSS.escape(chat.id)}"]`,
+        `.container-action[data-chat-id="${CSS.escape(task.chat.id)}"]`,
       ) as HTMLButtonElement | null) ?? document.createElement("button")
-    const success = await syncContainer(chat.id, chatDisplayName(chat), rowBtn)
-    if (success) ok++
-    else fail++
+    if (task.kind === "messages") {
+      const success = await downloadChat(task.chat.id, chatDisplayName(task.chat), rowBtn)
+      if (success) ok++
+      else fail++
+    } else {
+      // Recordings stream: pull every recording in this chat. downloadContainerTranscripts
+      // no-ops with a status if the chat has no (scanned) recordings.
+      const container =
+        recordingsMap.get(task.chat.id) ??
+        recordingsState.containers.find((c) => c.chatId === task.chat.id)
+      if (container && container.recordings.length > 0) {
+        await downloadContainerTranscripts(task.chat.id, rowBtn)
+        ok++
+      } else {
+        fail++
+      }
+    }
   }
   bulkBtn.disabled = false
   bulkBtn.textContent = originalLabel || ""
   setStatus(
-    `Download complete \u2014 saved ${ok}${fail > 0 ? `, ${fail} didn\u2019t come through` : ""}.`,
+    `Sync complete \u2014 ${ok} favorited stream${ok !== 1 ? "s" : ""} pulled${fail > 0 ? `, ${fail} skipped or didn\u2019t come through` : ""}.`,
   )
   updateBulkButtons()
+}
+
+// ----- Download selected artifacts (Phase 1 ephemeral selection) -----
+
+async function downloadSelectedArtifacts(): Promise<void> {
+  if (selectedArtifacts.size === 0) return
+  const btn = document.getElementById("download-selected") as HTMLButtonElement | null
+  if (!btn) return
+  const artifacts = [...selectedArtifacts]
+  const originalLabel = btn.textContent
+  btn.disabled = true
+  let done = 0
+  let ok = 0
+
+  for (const artifactId of artifacts) {
+    done++
+    btn.textContent = `Downloading ${done}/${artifacts.length}\u2026`
+    const tempBtn = document.createElement("button")
+
+    if (artifactId.startsWith("msg:")) {
+      const chatId = artifactId.slice(4)
+      const chat = chatsState.chats.find((c) => c.id === chatId)
+      if (chat) {
+        const success = await downloadChat(chatId, chatDisplayName(chat), tempBtn)
+        if (success) ok++
+      }
+    } else if (artifactId.startsWith("rec:")) {
+      const recId = artifactId.slice(4)
+      const outcome = await downloadRecordingTranscript(recId, tempBtn)
+      if (outcome === "ok") ok++
+    }
+  }
+
+  // Clear selection
+  selectedArtifacts.clear()
+  btn.disabled = false
+  btn.textContent = originalLabel || ""
+  updateSelectedButton()
+  // Reset all artifact and group checkboxes in the DOM
+  document
+    .querySelectorAll<HTMLInputElement>(".artifact-check, .select-all-check")
+    .forEach((cb) => {
+      cb.checked = false
+      cb.indeterminate = false
+    })
+  setStatus(
+    `Download complete \u2014 ${ok} of ${artifacts.length} artifact${artifacts.length !== 1 ? "s" : ""} saved.`,
+  )
 }
 
 // ----- Settings modal -----

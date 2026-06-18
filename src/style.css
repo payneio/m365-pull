@@ -391,10 +391,7 @@ header {
 }
 
 .chat-row {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  padding: 0.75rem 1rem;
+  display: block; /* Phase 1: changed from flex — header + artifact-rows stack vertically */
   border-bottom: 1px solid var(--border);
 }
 
@@ -404,6 +401,93 @@ header {
 
 .chat-row:hover {
   background: var(--row-hover);
+}
+
+/* Phase 1: inner header takes over the flex role the old .chat-row had */
+.chat-row-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+}
+
+/* Phase 1: expand/collapse toggle */
+.expand-toggle {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  width: 1.25rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1;
+  user-select: none;
+}
+.expand-toggle:hover {
+  color: var(--fg);
+}
+
+/* Phase 1: group select-all checkbox */
+.select-all-check {
+  flex-shrink: 0;
+  width: 1rem;
+  height: 1rem;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+/* Phase 1: expanded artifact rows container */
+.artifact-rows {
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  padding: 0.15rem 0;
+}
+
+/* Phase 1: individual artifact row */
+.artifact-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.35rem 1rem 0.35rem 3.25rem; /* left-indent to align under chat-info */
+}
+.artifact-row:hover {
+  background: var(--row-hover);
+}
+
+/* Phase 1: artifact checkbox */
+.artifact-check {
+  flex-shrink: 0;
+  width: 1rem;
+  height: 1rem;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+/* Phase 1: artifact type icon (💬, 🎙) */
+.artifact-type-icon {
+  flex-shrink: 0;
+  font-size: 0.95rem;
+}
+
+/* Phase 1: artifact info text block */
+.artifact-info {
+  flex: 1;
+  min-width: 0;
+}
+.artifact-name {
+  font-size: 0.875rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.artifact-sub {
+  font-size: 0.775rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-info {
@@ -667,6 +751,60 @@ header {
 
 .chat-row.marked {
   background: linear-gradient(to right, rgba(245, 158, 11, 0.06), transparent 80%);
+}
+
+/* Phase 2: read-only favorite STATE glyph on the collapsed row (not a toggle). */
+.fav-state {
+  flex-shrink: 0;
+  width: 1.5rem;
+  text-align: center;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: #c0c0c0;
+  user-select: none;
+  cursor: default;
+}
+.fav-state.favorited {
+  color: #f59e0b;
+}
+
+/* Phase 2: favorite TOGGLE star — lives in the expanded view (messages row +
+ * recordings group header). Interactive, mirrors the old star affordance. */
+.fav-toggle {
+  flex-shrink: 0;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+  color: #c0c0c0;
+  transition: color 100ms, transform 100ms;
+}
+.fav-toggle:hover {
+  color: #f59e0b;
+  transform: scale(1.1);
+  background: transparent;
+}
+.fav-toggle.favorited {
+  color: #f59e0b;
+}
+
+/* Phase 2: recordings-stream group header inside the expanded view. */
+.artifact-group-header {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.3rem 1rem 0.2rem 3.25rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.artifact-group-label {
+  font-weight: 600;
 }
 
 /* Ignore toggle on each chat row — mirrors .mark-toggle; 44px min hit target (Item 6) */

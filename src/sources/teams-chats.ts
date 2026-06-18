@@ -1,4 +1,5 @@
 import type { PublicClientApplication } from "@azure/msal-browser"
+import { sanitizeFilenameName, formatPulledStamp } from "./filename-format"
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -264,53 +265,40 @@ export async function fetchChatMessages(
   return out.slice(0, cap)
 }
 
-/** Best-effort display name for a chat. */
-/** Build a human-readable, conflict-resistant filename for a chat archive.
+/** Build a versioned, sort-by-name-friendly filename for a chat archive
+ * (Phase 3). Format:
  *
- * - `withTimestamp: true` -> includes <YYYY-MM-DD>-<HHMM> prefix. Used for
- *   browser saves (one file per download, never overwrites).
- * - `withTimestamp: false` -> stable per chat. Used for OneDrive saves (the
- *   cumulative-archive pattern relies on the same filename across downloads).
+ *   <Name>__chat__pulled-<YYYY-MM-DD-HHMM>__<rangeStart>_to_<rangeEnd>.<ext>
  *
- * The chatId is hashed to 8 hex chars (djb2, deterministic) for uniqueness
- * without the 80+ chars of dashes-stripped chatId.
+ * - <Name>          = sanitized chat display name (keeps human-readable spaces)
+ * - pulled-<...>     = when THIS version was downloaded (primary sort/version key)
+ * - <rangeStart>/<rangeEnd> = the real YYYY-MM-DD span of the messages INCLUDED
+ *   in this download (resolved bounds, not the literal "all"/"since" words)
+ *
+ * The same name is used for BOTH the browser and OneDrive destinations, so every
+ * pull is its own dated file and sort-by-name reveals the version history.
  *
  * Examples:
- *   2026-05-27-1843-Marc-Goodner-a3f12b8c.json   (browser, 1:1)
- *   Team-Pulse-Workstream-5d2e9f01.json          (OneDrive, named group)
+ *   Marc Goodner__chat__pulled-2026-06-17-1843__2026-05-18_to_2026-06-17.md
+ *   Team Pulse Workstream__chat__pulled-2026-06-17-0902__2026-06-10_to_2026-06-17.md
  */
 export function buildChatArchiveFilename(
-  chatId: string,
   displayName: string,
-  options: { withTimestamp: boolean; extension: string },
+  options: {
+    pulledAt: Date
+    /** ISO YYYY-MM-DD of the earliest included message (resolved). */
+    rangeStart: string
+    /** ISO YYYY-MM-DD of the latest included message (resolved). */
+    rangeEnd: string
+    extension: string
+  },
 ): string {
-  const slug =
-    (displayName || "chat")
-      .replace(/[^a-zA-Z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 60)
-      .replace(/-+$/g, "") || "chat"
-
-  // djb2 hash of chatId -> 8 hex chars. Same input -> same output, so
-  // OneDrive's archive lookup stays stable across downloads.
-  let h = 5381
-  for (let i = 0; i < chatId.length; i++) {
-    h = ((h << 5) + h + chatId.charCodeAt(i)) | 0
-  }
-  const shortId = (h >>> 0).toString(16).padStart(8, "0")
-
+  const name = sanitizeFilenameName(displayName)
+  const pulled = formatPulledStamp(options.pulledAt)
   const ext = options.extension.startsWith(".")
     ? options.extension
     : `.${options.extension}`
-
-  if (options.withTimestamp) {
-    const d = new Date()
-    const pad = (n: number) => String(n).padStart(2, "0")
-    const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
-    const time = `${pad(d.getHours())}${pad(d.getMinutes())}`
-    return `${date}-${time}-${slug}-${shortId}${ext}`
-  }
-  return `${slug}-${shortId}${ext}`
+  return `${name}__chat__pulled-${pulled}__${options.rangeStart}_to_${options.rangeEnd}${ext}`
 }
 
 export function chatDisplayName(chat: TeamsChatItem): string {

@@ -57,11 +57,18 @@ export interface UserPrefs {
 }
 
 export interface AppState {
-  version: 1
+  /** Schema version. 1 = legacy whole-container marks (bare chatId).
+   * 2 = Phase 2 per-stream favorites: messages stream = bare `chatId`,
+   * recordings stream = `chatId::rec`. Still a single `marks` string set,
+   * so the additive union merge below works unchanged across versions. */
+  version: 1 | 2
   updatedAt: string
   updatedBy: string
-  /** Item IDs the user has marked. Holds chat IDs and recording IDs
-   * (composite callId::filename) -- distinct keyspaces, same Set. */
+  /** Favorited stream IDs (a single union-merged string set):
+   *   messages stream  -> bare `chatId`
+   *   recordings stream -> `chatId::rec`
+   * v1 states hold only bare chatIds (whole-container keeps); they are
+   * migrated to favorite BOTH streams on first Phase 2 load. */
   marks: string[]
   /** Chat IDs the user has ignored. Hidden from the default list view;
    * revealed only via the "Show ignored" filter toggle. Merged additively
@@ -105,7 +112,11 @@ export async function loadOneDriveState(
     )
   }
   const data = (await response.json()) as AppState
-  if (data.version !== 1) {
+  // Accept v1 (legacy whole-container marks) and v2 (per-stream favorites).
+  // v1 states are migrated in-app on load (marks gain `chatId::rec` for any
+  // bare chatId) and written back as v2. Unknown future versions are treated
+  // as empty so a newer client's schema is never silently corrupted by us.
+  if (data.version !== 1 && data.version !== 2) {
     console.warn(
       "Unknown state schema version; treating as empty:",
       data.version,
