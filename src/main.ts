@@ -66,13 +66,21 @@ const msal = new PublicClientApplication({
   auth: {
     clientId: config.clientId,
     authority: `https://login.microsoftonline.com/${config.tenantId}`,
-    redirectUri: window.location.origin,
+    redirectUri: window.location.origin + "/auth-callback",
   },
 })
 
 await msal.initialize()
 const redirectResp = await msal.handleRedirectPromise()
 if (redirectResp?.account) msal.setActiveAccount(redirectResp.account)
+
+// MSAL returns the auth code to the anonymous /auth-callback route, which is kept OUTSIDE the
+// EasyAuth `authenticated` gate so the #code fragment survives the round-trip (the gate would
+// otherwise 302 the return to /.auth/login and strip the fragment -> login loop). Once the
+// account is established in the MSAL cache here, route into the real app at /.
+if (window.location.pathname === "/auth-callback") {
+  window.location.replace("/")
+}
 
 if (!msal.getActiveAccount()) {
   const cached = msal.getAllAccounts()

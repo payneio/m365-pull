@@ -5,6 +5,7 @@
   },
   "routes": [
     { "route": "/.auth/*", "allowedRoles": ["anonymous", "authenticated"] },
+    { "route": "/auth-callback", "allowedRoles": ["anonymous", "authenticated"] },
     { "route": "/*", "allowedRoles": ["authenticated"] }
   ],
   "responseOverrides": {
