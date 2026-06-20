@@ -1536,8 +1536,11 @@ function messagesArtifactRowHtml(
   const dlTag = lastSync
     ? `Downloaded ${formatDateShort(new Date(lastSync))}`
     : "Not downloaded yet"
+  const lastActivity = formatDate(new Date(chatActivityDate(chat)).toISOString())
   const nameRaw = flat ? chatName : "Messages"
-  const subRaw = flat ? `Messages \u00b7 ${dlTag}` : dlTag
+  const subRaw = flat
+    ? `Messages \u00b7 ${lastActivity} \u00b7 ${dlTag}`
+    : `${lastActivity} \u00b7 ${dlTag}`
   const tag = flat ? "li" : "div"
   const flatClass = flat ? " artifact-flat" : ""
   const ctxSuffix = flat ? ` for ${chatName}` : ""
@@ -1677,9 +1680,41 @@ function renderFlatArtifactRows(chats: TeamsChatItem[]): string {
     items.sort((a, b) => b.ms - a.ms)
     return items.map((i) => i.html).join("")
   }
-  // name / marked-first: the chats array is already sorted at the container
-  // level; emit artifacts in container order so items from the same named
-  // container stay together (which is the natural expectation for name sort).
+  if (filterState.sortKey === "marked-first") {
+    // Build a flat per-artifact list where each artifact carries its own sort
+    // keys: primary = whether THIS artifact's specific stream is favorited
+    // (per-stream, not whole-chat), secondary = date descending (same
+    // per-artifact timestamps as the "recent" branch above).
+    const items: { fav: boolean; ms: number; html: string }[] = []
+    for (const chat of chats) {
+      if (loadIncludeMessages) {
+        items.push({
+          fav: isMessagesFavorited(chat.id),     // messages-stream key = bare chatId
+          ms: chatActivityDate(chat),
+          html: messagesArtifactRowHtml(chat, "flat"),
+        })
+      }
+      const rc = recordingsMap.get(chat.id)
+      if (rc && rc.recordings.length > 0) {
+        for (const rec of rc.recordings) {
+          items.push({
+            fav: isRecordingsFavorited(chat.id), // recordings-stream key (per recStreamKey)
+            ms: new Date(rec.eventCreatedDateTime).getTime(),
+            html: recordingArtifactRowHtml(chat, rec, "flat"),
+          })
+        }
+      }
+    }
+    // Two-key sort: favorited artifacts first (true before false), then date desc.
+    items.sort((a, b) => {
+      if (a.fav !== b.fav) return a.fav ? -1 : 1
+      return b.ms - a.ms
+    })
+    return items.map((i) => i.html).join("")
+  }
+  // name: the chats array is already sorted at the container level; emit
+  // artifacts in container order so items from the same named container stay
+  // together (the natural expectation for name sort).
   const parts: string[] = []
   for (const chat of chats) {
     // Build B: Messages OFF => recordings-only; suppress the Messages artifact row.
