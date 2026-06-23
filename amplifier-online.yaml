@@ -4,16 +4,15 @@
 name: payne-m365-pull
 stack: static-web-app
 
-# Bring your own Entra app registration (optional):
-# auth:
-#   client_id: "your-client-id-here"
-# When set, the platform validates but does not create or modify the app registration.
+# Bring your own Entra app registration:
+# Platform validates but does not create or modify this app registration.
 # You are responsible for configuring identifier URIs, scopes, and redirect URIs.
+auth:
+  client_id: "4db50d9a-6140-40c0-a205-f7ff21ba18a6"
 
 # Push-to-deploy configuration (project-level default).
-# Uncomment and set repo to enable push-triggered deployments.
 deploy:
-  repo: "payneio/m365-pull"
+  repo: "https://github.com/payneio/m365-pull"
   ref: refs/heads/main
 
 # Static frontend (built and deployed by GitHub Actions)
@@ -21,12 +20,11 @@ deploy:
 # Configure login requirements via staticwebapp.config.json in your repo.
 frontend:
   type: static-web-app
-  repo: "payneio/m365-pull"
+  repo: "https://github.com/payneio/m365-pull"  # GitHub repo URL
   branch: main
-  app_location: "/"
-  output_location: "dist"
-  build_command: "npm run build"
-  protected: login
+  app_location: "/"  # Path to frontend code in repo (e.g., "/frontend" for monorepo)
+  output_location: "dist"  # Build output directory (must match vite/webpack/next config)
+  build_command: "npm run build"  # Optional - defaults to "npm run build"
 
 # Note: This stack is STATIC ONLY (no backend, no databases, no SSR)
 # Need backend API? Use web-app-awa (Web App + Static Web App)
