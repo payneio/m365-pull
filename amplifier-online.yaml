@@ -8,7 +8,7 @@ stack: static-web-app
 # Platform validates but does not create or modify this app registration.
 # You are responsible for configuring identifier URIs, scopes, and redirect URIs.
 auth:
-  client_id: "4db50d9a-6140-40c0-a205-f7ff21ba18a6"
+  client_app_id: "4db50d9a-6140-40c0-a205-f7ff21ba18a6"
 
 # Push-to-deploy configuration (project-level default).
 deploy:
