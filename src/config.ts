@@ -10,8 +10,8 @@
 
 export const config = {
   // Application (client) ID from your Entra app registration
-  clientId: import.meta.env.VITE_MSAL_CLIENT_ID ?? "",
+  clientId: import.meta.env.VITE_AZURE_CLIENT_ID ?? "",
 
   // Directory (tenant) ID — your tenant's GUID
-  tenantId: import.meta.env.VITE_MSAL_TENANT_ID ?? "",
+  tenantId: import.meta.env.VITE_AZURE_TENANT_ID ?? "",
 }

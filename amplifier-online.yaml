@@ -1,0 +1,59 @@
+# Amplifier Online - Azure Static Web App Stack Configuration
+# Documentation: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/static-web-app.md
+
+name: payne-m365-pull
+stack: static-web-app
+
+# Bring your own Entra app registration (optional):
+# auth:
+#   client_id: "your-client-id-here"
+# When set, the platform validates but does not create or modify the app registration.
+# You are responsible for configuring identifier URIs, scopes, and redirect URIs.
+
+# Push-to-deploy configuration (project-level default).
+# Uncomment and set repo to enable push-triggered deployments.
+deploy:
+  repo: "payneio/m365-pull"
+  ref: refs/heads/main
+
+# Static frontend (built and deployed by GitHub Actions)
+# Auth (EasyAuth + AZURE_CLIENT_ID) is configured unconditionally by the platform.
+# Configure login requirements via staticwebapp.config.json in your repo.
+frontend:
+  type: static-web-app
+  repo: "payneio/m365-pull"
+  branch: main
+  app_location: "/"
+  output_location: "dist"
+  build_command: "npm run build"
+  protected: login
+
+# Note: This stack is STATIC ONLY (no backend, no databases, no SSR)
+# Need backend API? Use web-app-awa (Web App + Static Web App)
+# Need SSR or containers? Use web-app-aca (Container Apps)
+
+# BEFORE YOU DEPLOY:
+# 1. Commit your frontend code to a GitHub repository
+# 2. Test build locally: npm run build
+# 3. Verify output_location matches your build config (dist/, build/, out/)
+# 4. Update frontend.repo above with your GitHub repository URL
+# 5. Run: amplifier-online up
+#
+# AFTER DEPLOYMENT:
+# - Generate CI/CD: amplifier-online cicd create
+#   (prints the gh secret set commands with the actual deployment token)
+# - Run the printed commands to configure GitHub secrets
+# - Push to GitHub: automatic deployment starts!
+#
+# AUTOMATIC FEATURES:
+# ✅ PR preview deployments (each PR gets its own URL)
+# ✅ Free custom domain SSL certificates
+# ✅ Built-in authentication (EasyAuth)
+# ✅ GitHub-integrated CI/CD
+#
+# COMMON ISSUES:
+# - SPA routing 404s on refresh? Add staticwebapp.config.json with navigationFallback
+# - Build fails? Check GitHub Actions logs and match Node version locally
+# - Wrong files deployed? Verify output_location matches your build output directory
+#
+# Need help? See: https://github.com/microsoft/amplifier-online/blob/main/docs/stacks/static-web-app.md
